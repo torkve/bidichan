@@ -1,0 +1,11 @@
+/bidichan
+/bidichan.exe
+*.test
+*.out
+*.log
+*.key
+*.crt
+*.pem
+*.sock
+.idea/
+.vscode/
