@@ -15,23 +15,30 @@ import (
 )
 
 // ClientConfig configures the dialing side. Hostname is used as both the SNI
-// extension and the Host: header — they must match what the server expects.
+// extension and the Host: header.
 type ClientConfig struct {
 	Hostname           string
 	PSK                []byte
 	InsecureSkipVerify bool
+
+	// Network selects the transport. "" / "tcp" (default) dials TCP and
+	// negotiates a uTLS Chrome-fingerprinted TLS 1.2 session. "unix" dials a
+	// local unix socket and skips TLS — useful for testing the auth+mux
+	// path against a plain-mode server.
+	Network string
+
+	// SkipBinding tells the client not to include the TLS-unique channel
+	// binding in the auth HMAC. Set this when the server is behind a
+	// TLS-terminating reverse proxy (e.g. nginx + proxy_pass) — bidichan
+	// sees plain bytes there and has no shared TLS session with us, so
+	// any binding we send would not match what the server expects.
+	// Also implicitly set when Network=="unix" since there is no TLS to
+	// derive a binding from.
+	SkipBinding bool
 }
 
-// Dial opens a TCP connection to addr, performs a TLS handshake whose
-// ClientHello mimics a current Chrome build (via uTLS), then runs the
-// HTTP/1.1 + PSK upgrade. The returned net.Conn is ready for multiplex
-// framing.
-//
-// The Chrome ClientHello fingerprint matters here because passive DPI
-// almost always inspects TLS handshakes via JA3/JA4 — Go's stdlib
-// produces a recognisable fingerprint, so a stock client would stand out.
-// HelloChrome_Auto rotates to the latest published Chrome and gives us a
-// ClientHello indistinguishable from real browser traffic.
+// Dial opens a connection to addr and performs the auth handshake. The
+// returned net.Conn is ready for multiplex framing.
 func Dial(ctx context.Context, addr string, cfg ClientConfig) (net.Conn, error) {
 	if len(cfg.PSK) == 0 {
 		return nil, errors.New("transport: empty PSK")
@@ -39,48 +46,71 @@ func Dial(ctx context.Context, addr string, cfg ClientConfig) (net.Conn, error) 
 	if cfg.Hostname == "" {
 		return nil, errors.New("transport: empty hostname")
 	}
-	d := net.Dialer{KeepAlive: 30 * time.Second}
-	raw, err := d.DialContext(ctx, "tcp", addr)
+	network := cfg.Network
+	if network == "" {
+		network = "tcp"
+	}
+	if network != "tcp" && network != "unix" {
+		return nil, fmt.Errorf("transport: invalid network %q", network)
+	}
+
+	d := net.Dialer{}
+	if network == "tcp" {
+		d.KeepAlive = 30 * time.Second
+	}
+	raw, err := d.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}
 
-	// We do NOT clamp the version range to TLS 1.2 on the client. A real
-	// Chrome offers TLS 1.3 + 1.2 in its ClientHello; the server (which
-	// pins MaxVersion=TLS12) will negotiate down to 1.2, and the resulting
-	// wire shape is exactly what a Chrome-to-old-nginx session looks like.
-	tlsC := &utls.Config{
-		ServerName:         cfg.Hostname,
-		InsecureSkipVerify: cfg.InsecureSkipVerify,
-		NextProtos:         []string{"http/1.1"},
-	}
-	uconn := utls.UClient(raw, tlsC, utls.HelloChrome_Auto)
-
-	if dl, ok := ctx.Deadline(); ok {
-		_ = uconn.SetDeadline(dl)
+	var (
+		appConn net.Conn
+		binding []byte
+	)
+	if network == "unix" {
+		appConn = raw
 	} else {
-		_ = uconn.SetDeadline(time.Now().Add(15 * time.Second))
-	}
-	if err := uconn.HandshakeContext(ctx); err != nil {
-		_ = uconn.Close()
-		return nil, fmt.Errorf("tls handshake: %w", err)
+		// Use uTLS to mimic Chrome's ClientHello. Passive DPI relies on
+		// JA3/JA4 over the ClientHello; Go's stdlib produces a
+		// recognisable fingerprint, while HelloChrome_Auto matches the
+		// current published Chrome build.
+		tlsC := &utls.Config{
+			ServerName:         cfg.Hostname,
+			InsecureSkipVerify: cfg.InsecureSkipVerify,
+			NextProtos:         []string{"http/1.1"},
+		}
+		uconn := utls.UClient(raw, tlsC, utls.HelloChrome_Auto)
+
+		if dl, ok := ctx.Deadline(); ok {
+			_ = uconn.SetDeadline(dl)
+		} else {
+			_ = uconn.SetDeadline(time.Now().Add(15 * time.Second))
+		}
+		if err := uconn.HandshakeContext(ctx); err != nil {
+			_ = uconn.Close()
+			return nil, fmt.Errorf("tls handshake: %w", err)
+		}
+		appConn = uconn
+		if !cfg.SkipBinding {
+			binding = uconn.ConnectionState().TLSUnique
+			if len(binding) == 0 {
+				_ = uconn.Close()
+				return nil, errors.New("tls binding unavailable (no EMS?)")
+			}
+		}
 	}
 
-	br, err := performClientAuth(uconn, cfg)
+	br, err := performClientAuth(appConn, cfg, binding)
 	if err != nil {
-		_ = uconn.Close()
+		_ = appConn.Close()
 		return nil, err
 	}
 
-	_ = uconn.SetDeadline(time.Time{})
-	return newBufferedConn(uconn, br), nil
+	_ = appConn.SetDeadline(time.Time{})
+	return newBufferedConn(appConn, br), nil
 }
 
-func performClientAuth(uconn *utls.UConn, cfg ClientConfig) (*bufio.Reader, error) {
-	binding := uconn.ConnectionState().TLSUnique
-	if len(binding) == 0 {
-		return nil, errors.New("tls binding unavailable (no EMS?)")
-	}
+func performClientAuth(appConn net.Conn, cfg ClientConfig, binding []byte) (*bufio.Reader, error) {
 	nonceHex, nonceBytes, err := freshNonce()
 	if err != nil {
 		return nil, fmt.Errorf("nonce: %w", err)
@@ -98,11 +128,11 @@ func performClientAuth(uconn *utls.UConn, cfg ClientConfig) (*bufio.Reader, erro
 		"X-BC-Time: " + strconv.FormatInt(ts, 10) + "\r\n" +
 		"Authorization: Bearer " + mac + "\r\n" +
 		"\r\n"
-	if _, err := io.WriteString(uconn, req); err != nil {
+	if _, err := io.WriteString(appConn, req); err != nil {
 		return nil, fmt.Errorf("write upgrade: %w", err)
 	}
 
-	br := bufio.NewReader(uconn)
+	br := bufio.NewReader(appConn)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
 		return nil, fmt.Errorf("read upgrade response: %w", err)

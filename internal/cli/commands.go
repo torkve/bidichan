@@ -52,11 +52,18 @@ func usage(w io.Writer) {
 
 Commands:
   listen   --addr HOST:PORT --hostname NAME --psk HEX [--cert FILE --key FILE] [--socket PATH]
+           listen --unix-socket PATH --hostname NAME --psk HEX [--socket PATH]
               Run as the server end. Accepts authenticated peers; serves an
-              nginx decoy to everyone else.
+              nginx decoy to everyone else (in TLS mode). With --unix-socket
+              the daemon binds a unix socket and skips TLS, expecting a
+              reverse proxy (e.g. nginx) to terminate TLS in front.
 
   connect  --addr HOST:PORT --hostname NAME --psk HEX [--socket PATH]
+              [--no-tls-binding]
+           connect --unix-socket PATH --hostname NAME --psk HEX
               Run as the dialing end. Establishes one peer to the server.
+              Pass --no-tls-binding when the server is behind a
+              TLS-terminating reverse proxy (binding cannot be shared).
 
   status   [--socket PATH]
               Show running peers and open channels on the local daemon.
@@ -83,11 +90,12 @@ SNI:  --hostname is sent as TLS SNI and Host: header; server enforces equality.
 
 func runListen(args []string) int {
 	fs := flag.NewFlagSet("listen", flag.ExitOnError)
-	addr := fs.String("addr", ":443", "TCP listen address (host:port)")
-	hostname := fs.String("hostname", "", "SNI hostname to require")
+	addr := fs.String("addr", ":443", "TCP listen address (host:port). Ignored if --unix-socket is set.")
+	unixPath := fs.String("unix-socket", "", "listen on a unix socket and skip TLS — for behind-nginx deployments")
+	hostname := fs.String("hostname", "", "SNI hostname to require (and Host: header in plain mode)")
 	pskHex := fs.String("psk", "", "pre-shared key (hex)")
-	certPath := fs.String("cert", "", "TLS certificate PEM (optional; self-signed if absent)")
-	keyPath := fs.String("key", "", "TLS key PEM (optional)")
+	certPath := fs.String("cert", "", "TLS certificate PEM (optional; self-signed if absent). Ignored in unix-socket mode.")
+	keyPath := fs.String("key", "", "TLS key PEM (optional). Ignored in unix-socket mode.")
 	sock := fs.String("socket", "", "local CLI control socket path (default XDG_RUNTIME_DIR/bidichan-<pid>.sock)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -102,16 +110,24 @@ func runListen(args []string) int {
 		return 2
 	}
 
+	bindAddr := *addr
+	network := "tcp"
+	if *unixPath != "" {
+		bindAddr = *unixPath
+		network = "unix"
+	}
+
 	logger := log.New(os.Stderr, "bidichan ", log.LstdFlags|log.Lmicroseconds)
 	d, err := daemon.New(daemon.Config{
-		Mode:          daemon.ModeListen,
-		BindAddr:      *addr,
-		Hostname:      *hostname,
-		PSK:           psk,
-		CertPath:      *certPath,
-		KeyPath:       *keyPath,
-		ControlSocket: *sock,
-		Logger:        logger,
+		Mode:             daemon.ModeListen,
+		BindAddr:         bindAddr,
+		Hostname:         *hostname,
+		PSK:              psk,
+		CertPath:         *certPath,
+		KeyPath:          *keyPath,
+		TransportNetwork: network,
+		ControlSocket:    *sock,
+		Logger:           logger,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -124,15 +140,27 @@ func runListen(args []string) int {
 
 func runConnect(args []string) int {
 	fs := flag.NewFlagSet("connect", flag.ExitOnError)
-	addr := fs.String("addr", "", "remote address (host:port)")
+	addr := fs.String("addr", "", "remote address (host:port). Ignored if --unix-socket is set.")
+	unixPath := fs.String("unix-socket", "", "dial a local unix socket and skip TLS — for behind-nginx testing")
 	hostname := fs.String("hostname", "", "SNI hostname to send and require")
 	pskHex := fs.String("psk", "", "pre-shared key (hex)")
+	noBind := fs.Bool("no-tls-binding", false, "omit the TLS-unique channel binding from auth — required when the server is behind a TLS-terminating reverse proxy")
 	sock := fs.String("socket", "", "local CLI control socket path")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if *addr == "" || *hostname == "" || *pskHex == "" {
-		fmt.Fprintln(os.Stderr, "connect: --addr, --hostname and --psk are required")
+	if *hostname == "" || *pskHex == "" {
+		fmt.Fprintln(os.Stderr, "connect: --hostname and --psk are required")
+		return 2
+	}
+	remote := *addr
+	network := "tcp"
+	if *unixPath != "" {
+		remote = *unixPath
+		network = "unix"
+	}
+	if remote == "" {
+		fmt.Fprintln(os.Stderr, "connect: --addr or --unix-socket is required")
 		return 2
 	}
 	psk, err := hex.DecodeString(*pskHex)
@@ -143,12 +171,14 @@ func runConnect(args []string) int {
 
 	logger := log.New(os.Stderr, "bidichan ", log.LstdFlags|log.Lmicroseconds)
 	d, err := daemon.New(daemon.Config{
-		Mode:          daemon.ModeConnect,
-		RemoteAddr:    *addr,
-		Hostname:      *hostname,
-		PSK:           psk,
-		ControlSocket: *sock,
-		Logger:        logger,
+		Mode:             daemon.ModeConnect,
+		RemoteAddr:       remote,
+		Hostname:         *hostname,
+		PSK:              psk,
+		TransportNetwork: network,
+		SkipBinding:      *noBind,
+		ControlSocket:    *sock,
+		Logger:           logger,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

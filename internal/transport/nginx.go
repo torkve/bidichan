@@ -2,9 +2,9 @@ package transport
 
 import (
 	"bufio"
-	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -42,7 +42,7 @@ Commercial support is available at
 // serveDecoy writes a plausible nginx response. If req is non-nil we honour the
 // request method (HEAD vs GET) so the decoy responds correctly to a probe.
 // The connection is closed after writing.
-func serveDecoy(c *tls.Conn, req *http.Request) {
+func serveDecoy(c net.Conn, req *http.Request) {
 	_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	defer c.Close()
 
@@ -77,7 +77,7 @@ func serveDecoy(c *tls.Conn, req *http.Request) {
 // then close. If they haven't sent anything yet (e.g. they finished the TLS
 // handshake but immediately got bored), we still wait briefly for a request so
 // our shape looks normal.
-func serveDecoyAndDrain(c *tls.Conn, br *bufio.Reader, firstReq *http.Request) {
+func serveDecoyAndDrain(c net.Conn, br *bufio.Reader, firstReq *http.Request) {
 	if firstReq != nil {
 		serveDecoy(c, firstReq)
 		return

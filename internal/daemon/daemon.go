@@ -45,6 +45,19 @@ type Config struct {
 	CertPath   string
 	KeyPath    string
 
+	// TransportNetwork is "tcp" (default) or "unix". When "unix" the listen
+	// or connect side skips TLS — used for behind-nginx deployments where a
+	// reverse proxy terminates TLS and forwards plain bytes to / from a
+	// local unix socket.
+	TransportNetwork string
+
+	// SkipBinding tells the client side to omit the TLS-unique channel
+	// binding from the auth HMAC. Required when connecting to a server
+	// that is behind a TLS-terminating reverse proxy (since we have no
+	// shared TLS session with that server). Implied when
+	// TransportNetwork=="unix" on the connect side.
+	SkipBinding bool
+
 	// ControlSocket is the Unix socket path where the local CLI talks to us.
 	// Defaults to $XDG_RUNTIME_DIR/bidichan-<pid>.sock or /tmp fallback.
 	ControlSocket string
@@ -106,18 +119,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 }
 
 func (d *Daemon) runListen(ctx context.Context) error {
+	if d.cfg.TransportNetwork == "unix" {
+		_ = os.Remove(d.cfg.BindAddr) // remove stale socket
+	}
 	lis, err := transport.Listen(ctx, d.cfg.BindAddr, transport.ServerConfig{
 		Hostname: d.cfg.Hostname,
 		PSK:      d.cfg.PSK,
 		CertPath: d.cfg.CertPath,
 		KeyPath:  d.cfg.KeyPath,
 		Logger:   d.logger,
+		Network:  d.cfg.TransportNetwork,
 	})
 	if err != nil {
 		return err
 	}
 	defer lis.Close()
-	d.logger.Printf("listening on %s, hostname=%s", lis.Addr(), d.cfg.Hostname)
+	if d.cfg.TransportNetwork == "unix" {
+		// Loosen perms so a same-host nginx worker can reach the socket.
+		_ = os.Chmod(d.cfg.BindAddr, 0o660)
+	}
+	d.logger.Printf("listening on %s (%s), hostname=%s", lis.Addr(), netLabel(d.cfg.TransportNetwork), d.cfg.Hostname)
 
 	for {
 		c, err := lis.Accept(ctx)
@@ -143,6 +164,8 @@ func (d *Daemon) runConnect(ctx context.Context) error {
 		Hostname:           d.cfg.Hostname,
 		PSK:                d.cfg.PSK,
 		InsecureSkipVerify: true,
+		Network:            d.cfg.TransportNetwork,
+		SkipBinding:        d.cfg.SkipBinding,
 	})
 	if err != nil {
 		return err
@@ -232,6 +255,13 @@ func defaultRuntimeDir() string {
 		return v
 	}
 	return os.TempDir()
+}
+
+func netLabel(n string) string {
+	if n == "" {
+		return "tcp"
+	}
+	return n
 }
 
 // touch ensures the daemon keeps imports consistent — used by tests.
