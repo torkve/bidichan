@@ -1,0 +1,67 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+# Cancel in-flight runs when a newer commit lands on the same ref. Saves
+# minutes when force-pushing through a PR.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build + vet + race tests
+    runs-on: ubuntu-latest
+    # The race test suite finishes in ~3s, but TestNginxDockerFront pulls
+    # nginx:alpine on a cold runner. Five minutes is roomy.
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # '1.25' resolves to the latest 1.25.x patch, which is what we
+          # want — pinning a patch would silently miss stdlib CVEs.
+          go-version: '1.25'
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        # The docker e2e test (TestNginxDockerFront) uses the
+        # docker daemon that ubuntu-latest runners ship pre-installed,
+        # so no extra setup needed.
+        run: go test -race -timeout 5m ./...
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        # Report-only: a finding here doesn't fail the build (Dependabot
+        # already opens PRs for actionable items). Use `continue-on-error`
+        # so the step is visible in the run summary but a vuln in stdlib
+        # or an unreachable transitive dep doesn't block the workflow.
+        continue-on-error: true
+        run: $(go env GOPATH)/bin/govulncheck ./...
