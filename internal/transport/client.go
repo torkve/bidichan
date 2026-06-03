@@ -3,7 +3,6 @@ package transport
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +10,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 // ClientConfig configures the dialing side. Hostname is used as both the SNI
@@ -21,8 +22,16 @@ type ClientConfig struct {
 	InsecureSkipVerify bool
 }
 
-// Dial opens a TCP+TLS connection to addr and performs the auth handshake.
-// Returns a net.Conn ready for multiplex framing.
+// Dial opens a TCP connection to addr, performs a TLS handshake whose
+// ClientHello mimics a current Chrome build (via uTLS), then runs the
+// HTTP/1.1 + PSK upgrade. The returned net.Conn is ready for multiplex
+// framing.
+//
+// The Chrome ClientHello fingerprint matters here because passive DPI
+// almost always inspects TLS handshakes via JA3/JA4 — Go's stdlib
+// produces a recognisable fingerprint, so a stock client would stand out.
+// HelloChrome_Auto rotates to the latest published Chrome and gives us a
+// ClientHello indistinguishable from real browser traffic.
 func Dial(ctx context.Context, addr string, cfg ClientConfig) (net.Conn, error) {
 	if len(cfg.PSK) == 0 {
 		return nil, errors.New("transport: empty PSK")
@@ -35,45 +44,49 @@ func Dial(ctx context.Context, addr string, cfg ClientConfig) (net.Conn, error) 
 	if err != nil {
 		return nil, err
 	}
-	tlsC := &tls.Config{
+
+	// We do NOT clamp the version range to TLS 1.2 on the client. A real
+	// Chrome offers TLS 1.3 + 1.2 in its ClientHello; the server (which
+	// pins MaxVersion=TLS12) will negotiate down to 1.2, and the resulting
+	// wire shape is exactly what a Chrome-to-old-nginx session looks like.
+	tlsC := &utls.Config{
 		ServerName:         cfg.Hostname,
-		MinVersion:         tls.VersionTLS12,
-		MaxVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
 		NextProtos:         []string{"http/1.1"},
 	}
-	tlsConn := tls.Client(raw, tlsC)
+	uconn := utls.UClient(raw, tlsC, utls.HelloChrome_Auto)
+
 	if dl, ok := ctx.Deadline(); ok {
-		_ = tlsConn.SetDeadline(dl)
+		_ = uconn.SetDeadline(dl)
 	} else {
-		_ = tlsConn.SetDeadline(time.Now().Add(15 * time.Second))
+		_ = uconn.SetDeadline(time.Now().Add(15 * time.Second))
 	}
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		_ = tlsConn.Close()
+	if err := uconn.HandshakeContext(ctx); err != nil {
+		_ = uconn.Close()
 		return nil, fmt.Errorf("tls handshake: %w", err)
 	}
 
-	br, err := performClientAuth(tlsConn, cfg)
+	br, err := performClientAuth(uconn, cfg)
 	if err != nil {
-		_ = tlsConn.Close()
+		_ = uconn.Close()
 		return nil, err
 	}
 
-	_ = tlsConn.SetDeadline(time.Time{})
-	return newBufferedConn(tlsConn, br), nil
+	_ = uconn.SetDeadline(time.Time{})
+	return newBufferedConn(uconn, br), nil
 }
 
-func performClientAuth(tlsConn *tls.Conn, cfg ClientConfig) (*bufio.Reader, error) {
-	exporter, err := deriveExporter(tlsConn)
-	if err != nil {
-		return nil, fmt.Errorf("tls exporter: %w", err)
+func performClientAuth(uconn *utls.UConn, cfg ClientConfig) (*bufio.Reader, error) {
+	binding := uconn.ConnectionState().TLSUnique
+	if len(binding) == 0 {
+		return nil, errors.New("tls binding unavailable (no EMS?)")
 	}
 	nonceHex, nonceBytes, err := freshNonce()
 	if err != nil {
 		return nil, fmt.Errorf("nonce: %w", err)
 	}
 	ts := time.Now().Unix()
-	mac := computeAuthMAC(cfg.PSK, "client", nonceBytes, ts, exporter)
+	mac := computeAuthMAC(cfg.PSK, "client", nonceBytes, ts, binding)
 
 	req := "GET /events HTTP/1.1\r\n" +
 		"Host: " + cfg.Hostname + "\r\n" +
@@ -85,11 +98,11 @@ func performClientAuth(tlsConn *tls.Conn, cfg ClientConfig) (*bufio.Reader, erro
 		"X-BC-Time: " + strconv.FormatInt(ts, 10) + "\r\n" +
 		"Authorization: Bearer " + mac + "\r\n" +
 		"\r\n"
-	if _, err := io.WriteString(tlsConn, req); err != nil {
+	if _, err := io.WriteString(uconn, req); err != nil {
 		return nil, fmt.Errorf("write upgrade: %w", err)
 	}
 
-	br := bufio.NewReader(tlsConn)
+	br := bufio.NewReader(uconn)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
 		return nil, fmt.Errorf("read upgrade response: %w", err)
@@ -107,7 +120,7 @@ func performClientAuth(tlsConn *tls.Conn, cfg ClientConfig) (*bufio.Reader, erro
 	if serverMAC == "" {
 		return nil, errors.New("server omitted X-BC-Verify")
 	}
-	wantServerMAC := computeAuthMAC(cfg.PSK, "server", nonceBytes, ts, exporter)
+	wantServerMAC := computeAuthMAC(cfg.PSK, "server", nonceBytes, ts, binding)
 	if !constantTimeEqHex(wantServerMAC, serverMAC) {
 		return nil, errors.New("server MAC mismatch")
 	}

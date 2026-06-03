@@ -213,11 +213,11 @@ func (l *Listener) verifyClientAuth(tlsConn *tls.Conn, req *http.Request) error 
 	if !l.seenNonces.add(nonceStr, time.Now()) {
 		return errors.New("nonce replay")
 	}
-	exporter, err := deriveExporter(tlsConn)
-	if err != nil {
-		return fmt.Errorf("tls exporter: %w", err)
+	binding := tlsConn.ConnectionState().TLSUnique
+	if len(binding) == 0 {
+		return errors.New("tls binding unavailable (no EMS?)")
 	}
-	want := computeAuthMAC(l.cfg.PSK, "client", nonce, ts, exporter)
+	want := computeAuthMAC(l.cfg.PSK, "client", nonce, ts, binding)
 	if !constantTimeEqHex(want, clientMAC) {
 		return errors.New("mac mismatch")
 	}
@@ -230,32 +230,45 @@ func (l *Listener) replySwitchingProtocols(tlsConn *tls.Conn, req *http.Request)
 	ts, _ := strconv.ParseInt(tsStr, 10, 64)
 	nonce, _ := parseNonce(nonceStr)
 
-	exporter, err := deriveExporter(tlsConn)
-	if err != nil {
-		return err
+	binding := tlsConn.ConnectionState().TLSUnique
+	if len(binding) == 0 {
+		return errors.New("tls binding unavailable (no EMS?)")
 	}
-	serverMAC := computeAuthMAC(l.cfg.PSK, "server", nonce, ts, exporter)
+	serverMAC := computeAuthMAC(l.cfg.PSK, "server", nonce, ts, binding)
 	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: " + upgradeToken + "\r\n" +
 		"Connection: Upgrade\r\n" +
 		"X-BC-Verify: " + serverMAC + "\r\n" +
 		"\r\n"
 	_ = tlsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	_, err = io.WriteString(tlsConn, resp)
+	_, err := io.WriteString(tlsConn, resp)
 	return err
 }
 
-// bufferedConn wraps a tls.Conn together with the bufio.Reader we used during
-// the HTTP handshake. Any bytes the client sent ahead of the body remain in
-// the bufio buffer and we need to drain them through Read for the multiplex
-// layer to see them.
+// bufferedConn wraps a TLS conn together with the bufio.Reader we used
+// during the HTTP handshake. Any bytes the peer sent ahead of the body
+// remain in the bufio buffer and we need to drain them through Read for
+// the multiplex layer to see them. The underlying conn is held as a
+// net.Conn so both the stdlib server (*tls.Conn) and the uTLS client
+// (*utls.UConn) can be wrapped uniformly.
 type bufferedConn struct {
-	*tls.Conn
+	net.Conn
 	r *bufio.Reader
 }
 
-func newBufferedConn(c *tls.Conn, r *bufio.Reader) *bufferedConn {
+func newBufferedConn(c net.Conn, r *bufio.Reader) *bufferedConn {
 	return &bufferedConn{Conn: c, r: r}
 }
 
 func (b *bufferedConn) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+// CloseWrite forwards a half-close to the underlying conn when supported.
+// Both *tls.Conn and *utls.UConn implement CloseWrite via their embedded
+// TCP conn; we surface it here so the forwarding loops can half-close one
+// direction without tearing down the whole stream.
+func (b *bufferedConn) CloseWrite() error {
+	if cw, ok := b.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return b.Conn.Close()
+}

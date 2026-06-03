@@ -4,7 +4,6 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -24,23 +23,26 @@ const upgradeToken = "bidichan/1"
 // replay tomorrow.
 const maxClockSkew = 90 * time.Second
 
-// exportLabel namespaces our TLS exporter so the keying material we derive
-// cannot collide with any other protocol's exporter usage on the same key.
-const exportLabel = "EXPERIMENTAL-bidichan-v1"
-
-// deriveExporter returns 32 bytes of keying material bound to the current TLS
-// session. We mix this into the auth HMAC so a passive observer who captures
-// the ciphertext cannot replay it against a different TLS handshake later.
-func deriveExporter(c *tls.Conn) ([]byte, error) {
-	st := c.ConnectionState()
-	return st.ExportKeyingMaterial(exportLabel, nil, 32)
-}
+// We bind the auth HMAC to the TLS session via the "tls-unique" channel
+// binding (RFC 5929) — the first Finished verify_data of the handshake.
+// Both peers see the same 12 bytes and we mix them into the MAC so a
+// passive observer who captures the upgrade request cannot replay it
+// against a different TLS session.
+//
+// We initially used ExportKeyingMaterial, but uTLS's Chrome/Firefox
+// ClientHello presets don't propagate the ekm setup through their custom
+// handshake path (only HelloGolang does), so on the client side
+// ExportKeyingMaterial returns "unavailable when renegotiation is
+// enabled". TLSUnique is exposed correctly on both sides in TLS 1.2 with
+// EMS, which is what gets negotiated here.
 
 // computeAuthMAC returns the HMAC-SHA256 over (role || nonce || timestamp ||
-// exporter), where role is "client" or "server". The two sides use different
-// role bytes so the client MAC can never be replayed as the server's reply
-// MAC (or vice versa).
-func computeAuthMAC(psk []byte, role string, nonce []byte, timestamp int64, exporter []byte) string {
+// channel_binding), where role is "client" or "server". The two sides use
+// different role bytes so the client MAC can never be replayed as the
+// server's reply MAC (or vice versa). channel_binding is the TLS-unique
+// value (RFC 5929) for the current TLS session — both peers compute the
+// same bytes.
+func computeAuthMAC(psk []byte, role string, nonce []byte, timestamp int64, binding []byte) string {
 	mac := hmac.New(sha256.New, psk)
 	mac.Write([]byte(role))
 	mac.Write([]byte{0})
@@ -50,7 +52,7 @@ func computeAuthMAC(psk []byte, role string, nonce []byte, timestamp int64, expo
 	tsStr := strconv.AppendInt(tsBuf[:0], timestamp, 10)
 	mac.Write(tsStr)
 	mac.Write([]byte{0})
-	mac.Write(exporter)
+	mac.Write(binding)
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
