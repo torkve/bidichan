@@ -320,6 +320,86 @@ file and writing its own control socket under
 won't help here (it searches `$XDG_RUNTIME_DIR`, not `/run/bidichan/`),
 so pass `--socket` explicitly.
 
+## Two-hop deployment (ProxyJump-style)
+
+When the final target sits behind an intermediate host — the same
+shape SSH gives with `ProxyJump` — bidichan supports A → B → C
+end-to-end with no special server code on the jump host. B is just a
+normal `bidichan listen` server. The inner TLS+PSK session terminates
+at C, so **B only ever sees ciphertext** and learns neither C's PSK
+nor the application payload.
+
+```
+           outer bidichan (B's TLS+PSK+yamux)
+A ─────────────────────────────────────────► B
+                                              │ TCP egress from B's
+                                              │ forward channel
+                                              ▼
+                                              C   (port 443)
+A ════════════════════════════════════════════► C
+           inner bidichan (C's TLS+PSK+yamux), end-to-end
+                — B sees only the inner ciphertext —
+```
+
+On client A, run two daemons. The first owns the connection to B; the
+second owns the connection to C and dials it *through* the forward
+channel the first daemon set up:
+
+```sh
+# 1. Peer connection through B (the jump host).
+bidichan connect \
+  --addr jump.example.com:443 \
+  --hostname jump.example.com \
+  --psk "$B_PSK" \
+  --socket /run/bidichan-jump.sock &
+
+# 2. Forward channel through B whose target is C's bidichan port.
+bidichan channel open forward \
+  -L 2222:cdn.example.com:443 \
+  --socket /run/bidichan-jump.sock
+
+# 3. Peer connection to C that dials the forward listener
+#    rather than C directly. The inner TLS+PSK session
+#    terminates at C; B sees only ciphertext.
+bidichan connect \
+  --addr 127.0.0.1:2222 \
+  --hostname cdn.example.com \
+  --psk "$C_PSK" \
+  --socket /run/bidichan-cdn.sock &
+```
+
+After step 3 you drive channels normally against the cdn socket:
+
+```sh
+bidichan channel open socks5 \
+  --listen 127.0.0.1:1080 \
+  --socket /run/bidichan-cdn.sock
+```
+
+Trade-offs to know about:
+
+- **TLS-in-TLS doubles per-byte CPU on A and C.** The single-hop
+  number from [BENCHMARKS.md](BENCHMARKS.md) is ~4.5 ms/MB; two-hop is
+  ~9 ms/MB. B's CPU cost is the same as single-hop (one TLS layer).
+- **Two daemons on A, two sockets, two PIDs.** Under systemd, run the
+  existing `bidichan@.service` twice (e.g. `bidichan@jump-B` and
+  `bidichan@cdn-via-B`); the unit's `RuntimeDirectory=bidichan/%i`
+  already keeps the sockets separate.
+- **Pick a fixed loopback port** for step 2 (`2222` here) — it makes
+  step 3 trivial. Using `:0` works too, but you have to look up the
+  bound port via `bidichan status --socket /run/bidichan-jump.sock`
+  before running step 3.
+- **The jump host needs no special config.** B is a normal `bidichan
+  listen`. C is a normal `bidichan listen`. The chain is composed
+  entirely on the client side.
+- **TUN through two hops** works but reduce the MTU (`--mtu 1300`)
+  because each TLS layer eats ~30 bytes per packet.
+
+A single-command `--jump` flag on `bidichan connect` (the SSH
+ProxyJump equivalent) is a possible follow-up; today the manual
+two-daemon recipe is the supported path and is exercised by
+`internal/e2e/twohop_test.go`.
+
 ## DPI behaviour
 
 - The client uses [uTLS](https://github.com/refraction-networking/utls)
