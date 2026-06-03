@@ -395,11 +395,6 @@ Trade-offs to know about:
 - **TUN through two hops** works but reduce the MTU (`--mtu 1300`)
   because each TLS layer eats ~30 bytes per packet.
 
-A single-command `--jump` flag on `bidichan connect` (the SSH
-ProxyJump equivalent) is a possible follow-up; today the manual
-two-daemon recipe is the supported path and is exercised by
-`internal/e2e/twohop_test.go`.
-
 ## DPI behaviour
 
 - The client uses [uTLS](https://github.com/refraction-networking/utls)
