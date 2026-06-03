@@ -161,6 +161,165 @@ Each daemon writes a Unix socket to `$XDG_RUNTIME_DIR/bidichan-<pid>.sock`
 than one running, pass `--socket /path/to/the.sock` explicitly. The same
 flag is available on every CLI subcommand.
 
+## Running as a service
+
+Two supported deployment shapes ship with the repo: a Docker image and a
+systemd template unit. Pick whichever fits your environment.
+
+### Docker
+
+A multi-stage `Dockerfile` builds a static, CGO-disabled binary on
+`golang:1.25-alpine` and ships it on `alpine:3.20` together with
+`iproute2` (needed when bidichan configures a TUN device).
+
+```sh
+docker build -t bidichan:latest .
+```
+
+The image runs as root inside the container because container
+namespaces are the security boundary — running as root inside an
+unprivileged container is the same pattern most official images use,
+and it sidesteps the file-capability dance that breaks under Docker's
+default capability bounding set (no `CAP_NET_ADMIN`).
+
+The image exposes `/run/bidichan` as a volume. Mount it on the host (or
+share it with a sibling container — e.g. nginx) to reach the local
+control socket from the host CLI.
+
+**Server, plain TCP+TLS on :443:**
+
+```sh
+docker run -d --name bidichan-server \
+  --restart=unless-stopped \
+  --network host \
+  -v /run/bidichan-server:/run/bidichan \
+  bidichan:latest \
+  listen --addr :443 --hostname cdn.example.com --psk "$PSK" \
+         --socket /run/bidichan/control.sock
+```
+
+(`--network host` is the simplest way to get :443 on the host. Use
+`-p 443:443` instead if you prefer port mapping.)
+
+**Server, plain mode behind nginx (full ServerHello parity):**
+
+```sh
+docker run -d --name bidichan-plain \
+  --restart=unless-stopped \
+  -v /run/bidichan-plain:/run/bidichan \
+  bidichan:latest \
+  listen --unix-socket /run/bidichan/data.sock --hostname cdn.example.com \
+         --psk "$PSK" --socket /run/bidichan/control.sock
+```
+
+Mount the same `/run/bidichan-plain` into your nginx container at the
+path its config expects, and point `proxy_pass` at
+`http://unix:/run/bidichan/data.sock`.
+
+**Client:**
+
+```sh
+docker run -d --name bidichan-client \
+  --restart=unless-stopped \
+  --network host \
+  -v /run/bidichan-client:/run/bidichan \
+  bidichan:latest \
+  connect --addr cdn.example.com:443 --hostname cdn.example.com \
+          --psk "$PSK" --socket /run/bidichan/control.sock
+```
+
+**TUN channel inside a container** needs both the device and the
+capability:
+
+```sh
+docker run -d --name bidichan-tun \
+  --cap-add=NET_ADMIN --device /dev/net/tun \
+  --network host \
+  -v /run/bidichan-tun:/run/bidichan \
+  bidichan:latest \
+  connect --addr cdn.example.com:443 --hostname cdn.example.com \
+          --psk "$PSK" --socket /run/bidichan/control.sock
+```
+
+**Driving the CLI from the host** — point it at the mounted socket:
+
+```sh
+bidichan status --socket /run/bidichan-server/control.sock
+bidichan channel open forward -L 8080:internal-api:8443 \
+  --socket /run/bidichan-client/control.sock
+```
+
+If you don't have the bidichan binary on the host, exec into the
+container instead:
+
+```sh
+docker exec -it bidichan-client bidichan channel open socks5 \
+  --listen 0.0.0.0:1080 --listen-side remote
+```
+
+### systemd
+
+A templated unit and example environment files live in `docs/systemd/`.
+Each instance reads `/etc/bidichan/<instance>.env` for its full argument
+list.
+
+Install once:
+
+```sh
+# binary
+install -m 0755 bidichan /usr/local/bin/
+
+# user + group
+useradd --system --no-create-home --shell /usr/sbin/nologin bidichan
+
+# unit
+install -m 0644 docs/systemd/bidichan@.service /etc/systemd/system/
+systemctl daemon-reload
+```
+
+Then per instance:
+
+```sh
+install -d -m 0750 -o root -g bidichan /etc/bidichan
+
+# Pick the right example. Each defines BIDICHAN_FLAGS.
+install -m 0640 -o root -g bidichan \
+  docs/systemd/listen.env.example /etc/bidichan/listen.env
+$EDITOR /etc/bidichan/listen.env   # set the hostname + PSK
+
+systemctl enable --now bidichan@listen
+```
+
+A per-instance subdirectory `/run/bidichan/<instance>/` is created by
+systemd's `RuntimeDirectory=bidichan/%i`, chowned to
+`bidichan:bidichan` at start and cleaned up at stop. Use it as the
+`--socket` path (the example envs already point each instance at its
+own subdir). For the plain-mode behind-nginx setup, add nginx's user to
+the `bidichan` group so its worker can traverse the runtime dir:
+
+```sh
+usermod -aG bidichan nginx     # or www-data, depending on distro
+systemctl restart nginx
+```
+
+The unit grants `CAP_NET_BIND_SERVICE` (for `:443`) and
+`CAP_NET_ADMIN` (for TUN) as ambient capabilities so the unprivileged
+`bidichan` user can bind low ports and create TUN devices without
+`setuid 0`. Drop one or both from `AmbientCapabilities=` /
+`CapabilityBoundingSet=` in your installed copy if an instance doesn't
+need them.
+
+`/dev/net/tun` is whitelisted via `DeviceAllow=`. Everything else is
+locked down (`NoNewPrivileges`, `ProtectSystem=strict`,
+`ProtectKernelTunables`, syscall filter, etc.).
+
+Multiple instances run side by side: `bidichan@listen`,
+`bidichan@connect`, `bidichan@plain`, etc., each reading its own env
+file and writing its own control socket under
+`/run/bidichan/<instance>/control.sock`. The CLI's auto-discovery
+won't help here (it searches `$XDG_RUNTIME_DIR`, not `/run/bidichan/`),
+so pass `--socket` explicitly.
+
 ## DPI behaviour
 
 - The client uses [uTLS](https://github.com/refraction-networking/utls)

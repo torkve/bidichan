@@ -1,0 +1,15 @@
+.git
+.gitignore
+.idea/
+.vscode/
+Dockerfile
+docker-compose*.yml
+README.md
+docs/
+*.test
+*.out
+*.log
+*.sock
+*.key
+*.crt
+*.pem
