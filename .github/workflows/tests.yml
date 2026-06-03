@@ -35,11 +35,17 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: Pre-pull nginx:alpine
+        # TestNginxDockerFront launches a container — pulling the image
+        # inline would land in the test's slow path and could race with
+        # waitForPort. Pull it once up-front so the test sees a warm cache.
+        run: docker pull nginx:alpine
+
       - name: go test -race
-        # The docker e2e test (TestNginxDockerFront) uses the
-        # docker daemon that ubuntu-latest runners ship pre-installed,
-        # so no extra setup needed.
-        run: go test -race -timeout 5m ./...
+        # -v so failing subtests print their progress messages directly to
+        # the workflow log (the only way we get to read them without a
+        # token capable of fetching raw job logs).
+        run: go test -race -v -timeout 5m ./...
 
   vuln:
     name: govulncheck

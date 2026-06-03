@@ -106,6 +106,12 @@ func TestNginxDockerFront(t *testing.T) {
 		serverPeer <- p
 	}()
 
+	// Log the host docker version up-front — useful when a test passes
+	// locally but fails on GHA on a different daemon.
+	if out, err := exec.Command("docker", "version", "--format", "{{.Server.Version}}").CombinedOutput(); err == nil {
+		t.Logf("docker server version: %s", strings.TrimSpace(string(out)))
+	}
+
 	// Run nginx in docker with the share dir bind-mounted RW so the worker
 	// can talk to the unix socket, and a random host port mapped to 443.
 	containerName := fmt.Sprintf("bidichan-e2e-%d", time.Now().UnixNano())
@@ -117,16 +123,19 @@ func TestNginxDockerFront(t *testing.T) {
 		"nginx:alpine",
 		"nginx", "-c", "/shared/nginx.conf", "-g", "daemon off;",
 	}
+	t.Logf("docker run %v", runArgs)
 	idBytes, err := exec.Command("docker", runArgs...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker run: %v\n%s", err, idBytes)
 	}
 	containerID := strings.TrimSpace(string(idBytes))
+	t.Logf("container %s started", containerID[:12])
 	t.Cleanup(func() {
 		_ = exec.Command("docker", "rm", "-f", containerID).Run()
 	})
 
 	hostPort := waitForPort(t, containerID)
+	t.Logf("nginx ready on 127.0.0.1:%d", hostPort)
 
 	// Sanity: an unauthenticated HTTPS probe to / hits real nginx and gets
 	// the location-/ body we configured — confirming the front-of-house is
@@ -322,9 +331,11 @@ func mustWrite(t *testing.T, path string, data []byte, mode os.FileMode) {
 
 // waitForPort polls `docker port` until it returns the host port mapped to
 // 443/tcp, then dials that port to ensure nginx has finished starting.
+// Timeouts are deliberately generous because GitHub-hosted runners can be
+// noticeably slower than a local docker daemon during image start-up.
 func waitForPort(t *testing.T, containerID string) int {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	var port int
 	for time.Now().Before(deadline) {
 		out, err := exec.Command("docker", "port", containerID, "443/tcp").CombinedOutput()
@@ -344,26 +355,29 @@ func waitForPort(t *testing.T, containerID string) int {
 		time.Sleep(100 * time.Millisecond)
 	}
 	if port == 0 {
+		dumpNginxLogs(t, containerID)
+		_ = exec.Command("docker", "inspect", containerID).Run()
 		t.Fatalf("nginx never published a host port (container %s)", containerID)
 	}
+	t.Logf("port mapping ready: 443 -> %d", port)
 	// Docker's userland proxy accepts TCP on the host port immediately even
 	// while nginx is still starting inside the container — a successful
 	// TCP dial here doesn't mean the TLS terminator is up. Poll until a
 	// real TLS handshake completes.
-	deadline = time.Now().Add(15 * time.Second)
+	deadline = time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		d := &net.Dialer{Timeout: 500 * time.Millisecond}
+		d := &net.Dialer{Timeout: 1 * time.Second}
 		raw, err := d.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 		if err == nil {
 			tc := tls.Client(raw, &tls.Config{InsecureSkipVerify: true, ServerName: "example.test"})
-			_ = tc.SetDeadline(time.Now().Add(500 * time.Millisecond))
+			_ = tc.SetDeadline(time.Now().Add(2 * time.Second))
 			if err := tc.Handshake(); err == nil {
 				_ = tc.Close()
 				return port
 			}
 			_ = tc.Close()
 		}
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
 	}
 	dumpNginxLogs(t, containerID)
 	t.Fatalf("nginx port %d never completed a TLS handshake", port)
