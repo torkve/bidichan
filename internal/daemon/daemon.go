@@ -30,8 +30,14 @@ type Daemon struct {
 	ctrlLis net.Listener
 	ctrlDir string
 
-	wg     sync.WaitGroup
-	cancel context.CancelFunc
+	wg sync.WaitGroup
+
+	// cancelMu protects cancel from a race between Run (which writes it
+	// after setting up its derived context) and Close (which calls it on
+	// shutdown). Both can fire concurrently when a signal handler races
+	// with daemon startup.
+	cancelMu sync.Mutex
+	cancel   context.CancelFunc
 }
 
 // Config describes how the daemon should be set up.
@@ -96,7 +102,9 @@ func New(cfg Config) (*Daemon, error) {
 // Run blocks until the daemon shuts down (via Close or fatal error).
 func (d *Daemon) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
+	d.cancelMu.Lock()
 	d.cancel = cancel
+	d.cancelMu.Unlock()
 	defer cancel()
 
 	if err := d.startCtrl(); err != nil {
@@ -204,10 +212,14 @@ func (d *Daemon) adoptPeer(ctx context.Context, conn net.Conn, role peer.Role) e
 }
 
 // Close stops accepting new connections, tears down peers, removes the
-// control socket, and unblocks Run.
+// control socket, and unblocks Run. Safe to call multiple times and before
+// Run has finished setting up its context.
 func (d *Daemon) Close() error {
-	if d.cancel != nil {
-		d.cancel()
+	d.cancelMu.Lock()
+	cancel := d.cancel
+	d.cancelMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 	if d.ctrlLis != nil {
 		_ = d.ctrlLis.Close()

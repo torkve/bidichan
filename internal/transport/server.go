@@ -109,6 +109,17 @@ func Listen(ctx context.Context, addr string, cfg ServerConfig) (*Listener, erro
 		return nil, err
 	}
 	l.inner = inner
+
+	// net.Listener.Accept() is a blocking syscall that does not watch ctx
+	// — without this goroutine, Accept stays blocked on a quiet port and
+	// the daemon hangs on SIGINT until the inner socket eventually errors
+	// out (which, on a TCP listener with no pending conns, is "never").
+	// Wire ctx cancellation to a Close on the listener so Accept unblocks.
+	go func() {
+		<-ctx.Done()
+		_ = l.Close()
+	}()
+
 	return l, nil
 }
 
