@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 # Cancel in-flight runs when a newer commit lands on the same ref. Saves
 # minutes when force-pushing through a PR.
 concurrency:
