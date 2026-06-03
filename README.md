@@ -78,6 +78,43 @@ bidichan status
 
 prints the connected peers and any open channels.
 
+### Config files (profiles)
+
+Repeating `--addr`, `--hostname`, and `--psk` on every invocation gets
+tedious. `listen` and `connect` also accept a profile name — a small
+`key = value` file that holds the settings once:
+
+```ini
+# ~/.config/bidichan/mypeer.conf  (mode 0600)
+addr     = cdn.example.com:443
+hostname = cdn.example.com
+psk-file = ~/.config/bidichan/mypeer.psk
+```
+
+Then:
+
+```sh
+bidichan listen mypeer            # or:  bidichan listen --config mypeer
+bidichan connect mypeer           # or:  bidichan connect --config mypeer
+```
+
+Profile lookup order: `$XDG_CONFIG_HOME/bidichan/<name>.conf`
+(default `~/.config/bidichan/`), then `/etc/bidichan/<name>.conf`.
+`--config` also accepts a literal path. Any CLI flag overrides the
+file value, so `bidichan connect mypeer --psk DEAD…` uses the
+override.
+
+Recognised keys mirror the CLI flags one-to-one (without the `--`
+prefix): `addr`, `unix-socket`, `hostname`, `psk`, `psk-file`,
+`no-tls-binding`, `cert`, `key`, `socket`. Unknown keys are a hard
+error so typos surface at startup. `~/` and `$VAR` are expanded in
+path-valued keys. The same file can be shared between server and
+client invocations — keys that don't apply to a given side are
+silently ignored.
+
+A fully-commented example with every key lives at
+[`docs/config/example.conf`](docs/config/example.conf).
+
 ## Opening channels
 
 `channel open` is invoked on either side and tells the local daemon what to

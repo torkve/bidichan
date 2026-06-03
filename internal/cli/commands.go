@@ -53,6 +53,7 @@ func usage(w io.Writer) {
 Commands:
   listen   --addr HOST:PORT --hostname NAME --psk HEX [--cert FILE --key FILE] [--socket PATH]
            listen --unix-socket PATH --hostname NAME --psk HEX [--socket PATH]
+           listen [<profile>] [--config NAME-OR-PATH] [flag overrides...]
               Run as the server end. Accepts authenticated peers; serves an
               nginx decoy to everyone else (in TLS mode). With --unix-socket
               the daemon binds a unix socket and skips TLS, expecting a
@@ -61,9 +62,16 @@ Commands:
   connect  --addr HOST:PORT --hostname NAME --psk HEX [--socket PATH]
               [--no-tls-binding]
            connect --unix-socket PATH --hostname NAME --psk HEX
+           connect [<profile>] [--config NAME-OR-PATH] [flag overrides...]
               Run as the dialing end. Establishes one peer to the server.
               Pass --no-tls-binding when the server is behind a
               TLS-terminating reverse proxy (binding cannot be shared).
+
+  Config files (listen and connect): a profile name resolves to
+  $XDG_CONFIG_HOME/bidichan/<name>.conf, then /etc/bidichan/<name>.conf.
+  The file is key=value text ('#' starts a comment) with the same key
+  names as the CLI flags (without --). CLI flags override file values.
+  Use --psk-file PATH to keep the secret in a separate file.
 
   status   [--socket PATH]
               Show running peers and open channels on the local daemon.
@@ -89,19 +97,44 @@ SNI:  --hostname is sent as TLS SNI and Host: header; server enforces equality.
 // --- listen ---
 
 func runListen(args []string) int {
+	positional, args := peelProfileArg(args)
 	fs := flag.NewFlagSet("listen", flag.ExitOnError)
+	configSrc := fs.String("config", "", "profile name or path to a config file (key=value); CLI flags override the file")
 	addr := fs.String("addr", ":443", "TCP listen address (host:port). Ignored if --unix-socket is set.")
 	unixPath := fs.String("unix-socket", "", "listen on a unix socket and skip TLS — for behind-nginx deployments")
 	hostname := fs.String("hostname", "", "SNI hostname to require (and Host: header in plain mode)")
 	pskHex := fs.String("psk", "", "pre-shared key (hex)")
+	pskFile := fs.String("psk-file", "", "file containing the hex PSK on a single line")
 	certPath := fs.String("cert", "", "TLS certificate PEM (optional; self-signed if absent). Ignored in unix-socket mode.")
 	keyPath := fs.String("key", "", "TLS key PEM (optional). Ignored in unix-socket mode.")
 	sock := fs.String("socket", "", "local CLI control socket path (default XDG_RUNTIME_DIR/bidichan-<pid>.sock)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	logger := log.New(os.Stderr, "bidichan ", log.LstdFlags|log.Lmicroseconds)
+
+	source, err := profileSourceFrom(positional, *configSrc, "listen")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	if path, err := applyProfile(fs, source, logger); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	} else if path != "" {
+		logger.Printf("loaded profile %s", path)
+	}
+
+	if *pskHex == "" && *pskFile != "" {
+		hexStr, err := readPSKFile(*pskFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read --psk-file: %v\n", err)
+			return 1
+		}
+		*pskHex = hexStr
+	}
 	if *hostname == "" || *pskHex == "" {
-		fmt.Fprintln(os.Stderr, "listen: --hostname and --psk are required")
+		fmt.Fprintln(os.Stderr, "listen: --hostname and --psk (or --psk-file / config) are required")
 		return 2
 	}
 	psk, err := hex.DecodeString(*pskHex)
@@ -117,7 +150,6 @@ func runListen(args []string) int {
 		network = "unix"
 	}
 
-	logger := log.New(os.Stderr, "bidichan ", log.LstdFlags|log.Lmicroseconds)
 	d, err := daemon.New(daemon.Config{
 		Mode:             daemon.ModeListen,
 		BindAddr:         bindAddr,
@@ -139,18 +171,43 @@ func runListen(args []string) int {
 // --- connect ---
 
 func runConnect(args []string) int {
+	positional, args := peelProfileArg(args)
 	fs := flag.NewFlagSet("connect", flag.ExitOnError)
+	configSrc := fs.String("config", "", "profile name or path to a config file (key=value); CLI flags override the file")
 	addr := fs.String("addr", "", "remote address (host:port). Ignored if --unix-socket is set.")
 	unixPath := fs.String("unix-socket", "", "dial a local unix socket and skip TLS — for behind-nginx testing")
 	hostname := fs.String("hostname", "", "SNI hostname to send and require")
 	pskHex := fs.String("psk", "", "pre-shared key (hex)")
+	pskFile := fs.String("psk-file", "", "file containing the hex PSK on a single line")
 	noBind := fs.Bool("no-tls-binding", false, "omit the TLS-unique channel binding from auth — required when the server is behind a TLS-terminating reverse proxy")
 	sock := fs.String("socket", "", "local CLI control socket path")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	logger := log.New(os.Stderr, "bidichan ", log.LstdFlags|log.Lmicroseconds)
+
+	source, err := profileSourceFrom(positional, *configSrc, "connect")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	if path, err := applyProfile(fs, source, logger); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	} else if path != "" {
+		logger.Printf("loaded profile %s", path)
+	}
+
+	if *pskHex == "" && *pskFile != "" {
+		hexStr, err := readPSKFile(*pskFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read --psk-file: %v\n", err)
+			return 1
+		}
+		*pskHex = hexStr
+	}
 	if *hostname == "" || *pskHex == "" {
-		fmt.Fprintln(os.Stderr, "connect: --hostname and --psk are required")
+		fmt.Fprintln(os.Stderr, "connect: --hostname and --psk (or --psk-file / config) are required")
 		return 2
 	}
 	remote := *addr
@@ -169,7 +226,6 @@ func runConnect(args []string) int {
 		return 2
 	}
 
-	logger := log.New(os.Stderr, "bidichan ", log.LstdFlags|log.Lmicroseconds)
 	d, err := daemon.New(daemon.Config{
 		Mode:             daemon.ModeConnect,
 		RemoteAddr:       remote,

@@ -1,0 +1,1 @@
+- [No real hostnames in persisted artefacts](feedback_no_real_hostnames.md) — only RFC 2606 placeholders (example.com etc.) in repo files, plan files, memory entries.
