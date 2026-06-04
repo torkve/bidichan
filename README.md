@@ -115,6 +115,27 @@ silently ignored.
 A fully-commented example with every key lives at
 [`docs/config/example.conf`](docs/config/example.conf).
 
+### Shell completion
+
+`bidichan completion <shell>` emits a completion script. Subcommands,
+per-subcommand flags, `channel open` kinds, and profile names (from
+`$XDG_CONFIG_HOME/bidichan` and `/etc/bidichan`) all get completed on
+`<TAB>`.
+
+```sh
+# bash, current shell only
+source <(bidichan completion bash)
+
+# bash, system-wide
+bidichan completion bash | sudo tee /etc/bash_completion.d/bidichan
+
+# zsh, per-user — pick the first fpath entry that's under $HOME
+bidichan completion zsh > "${fpath[1]}/_bidichan"
+
+# fish
+bidichan completion fish > ~/.config/fish/completions/bidichan.fish
+```
+
 ## Opening channels
 
 `channel open` is invoked on either side and tells the local daemon what to

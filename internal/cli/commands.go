@@ -37,6 +37,8 @@ func Run(args []string) int {
 		return runChannel(args[1:])
 	case "shutdown":
 		return runShutdown(args[1:])
+	case "completion":
+		return runCompletion(args[1:])
 	case "help", "-h", "--help":
 		usage(os.Stdout)
 		return 0
@@ -87,6 +89,14 @@ Commands:
 
   shutdown [--socket PATH]
               Ask the local daemon to exit.
+
+  completion bash|zsh|fish
+              Emit a shell completion script to stdout. Completes
+              subcommands, flags, and profile names from
+              $XDG_CONFIG_HOME/bidichan and /etc/bidichan.
+              Install (bash):  source <(bidichan completion bash)
+              Install (zsh):   bidichan completion zsh > "${fpath[1]}/_bidichan"
+              Install (fish):  bidichan completion fish > ~/.config/fish/completions/bidichan.fish
 
 Auth: --psk is a hex-encoded pre-shared key. Both sides must use the same value.
 SNI:  --hostname is sent as TLS SNI and Host: header; server enforces equality.
