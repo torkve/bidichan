@@ -3,13 +3,15 @@ package cli
 import (
 	"bufio"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+
+	"github.com/spf13/pflag"
 )
 
 // profileValues holds the union of fields a `listen` or `connect` config
@@ -264,10 +266,11 @@ func warnLooseSecretPerms(logger *log.Logger, path string, f *os.File) {
 // Profile keys that have no matching flag on the given FlagSet (e.g. a
 // `no-tls-binding` key in a `listen` profile) are silently ignored —
 // this lets one profile be shared between client and server invocations.
-func applyProfile(fs interface {
-	Lookup(string) *flag.Flag
-	Visit(func(*flag.Flag))
-}, source string, logger *log.Logger) (string, error) {
+//
+// pflag exposes the "was this flag set on the command line?" bit via
+// (*pflag.FlagSet).Changed; we use it to preserve CLI-over-config
+// precedence the same way the stdlib version used flag.FlagSet.Visit.
+func applyProfile(fs *pflag.FlagSet, source string, logger *log.Logger) (string, error) {
 	if source == "" {
 		return "", nil
 	}
@@ -275,11 +278,8 @@ func applyProfile(fs interface {
 	if err != nil {
 		return path, err
 	}
-	setOnCLI := map[string]bool{}
-	fs.Visit(func(f *flag.Flag) { setOnCLI[f.Name] = true })
-
 	set := func(name, val string) {
-		if setOnCLI[name] {
+		if fs.Changed(name) {
 			return
 		}
 		if f := fs.Lookup(name); f != nil {
@@ -333,28 +333,33 @@ func profileSourceFrom(positional, configFlag, cmdName string) (string, error) {
 	return positional, nil
 }
 
-// peelProfileArg pulls an optional leading positional profile name out
-// of args (anything that does not start with '-' or '/'). Returns the
-// detected profile name (or "") and the remaining args to be passed to
-// FlagSet.Parse.
-//
-// Literal paths (containing '/' or starting with '~') are NOT consumed
-// here — callers should use --config for explicit paths. This keeps
-// the positional name space simple and avoids accidental
-// "bidichan listen ./foo" misinterpretations.
-func peelProfileArg(args []string) (string, []string) {
-	if len(args) == 0 {
-		return "", args
+// ListProfileNames returns the de-duplicated, sorted profile names
+// discoverable in profileSearchDirs() — used by the cobra
+// ValidArgsFunction so `bidichan {listen,connect} <TAB>` and
+// `--config <TAB>` suggest the profiles that resolveProfilePath would
+// actually find at runtime.
+func ListProfileNames() []string {
+	seen := map[string]struct{}{}
+	for _, dir := range profileSearchDirs() {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if !strings.HasSuffix(name, ".conf") {
+				continue
+			}
+			seen[strings.TrimSuffix(name, ".conf")] = struct{}{}
+		}
 	}
-	first := args[0]
-	if first == "" || strings.HasPrefix(first, "-") {
-		return "", args
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
 	}
-	// Path-shaped tokens are not allowed as positional profiles to
-	// avoid swallowing accidental relative paths. Operators who want a
-	// literal path should use --config instead.
-	if strings.ContainsAny(first, "/\\") || strings.HasPrefix(first, "~") || strings.HasSuffix(first, ".conf") {
-		return "", args
-	}
-	return first, args[1:]
+	sort.Strings(out)
+	return out
 }

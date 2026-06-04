@@ -1,3 +1,14 @@
+// Package cli builds bidichan's command tree atop github.com/spf13/cobra.
+// Public surface:
+//
+//	func Execute(args []string) int   // called by main(); returns the
+//	                                  // process exit code.
+//
+// Every subcommand's RunE is a thin wrapper around either a long-lived
+// daemon (listen/connect) or a one-shot control-socket request
+// (status, channel ..., shutdown). The hand-written usage/completion
+// scaffolding the previous incarnation carried is replaced by cobra's
+// built-in help and shell-completion generation.
 package cli
 
 import (
@@ -5,553 +16,637 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/torkve/bidichan/internal/daemon"
 )
 
-// Run is the main entry point invoked from main(). It dispatches the
-// subcommand and returns a process exit code.
-func Run(args []string) int {
-	if len(args) < 1 {
-		usage(os.Stderr)
-		return 2
+// Execute parses args and runs the chosen subcommand. Returns the
+// process exit code. main() should `os.Exit(cli.Execute(os.Args[1:]))`.
+func Execute(args []string) int {
+	root := newRootCmd()
+	root.SetArgs(args)
+	if err := root.Execute(); err != nil {
+		// cobra already printed the error and usage when appropriate.
+		// Distinguish "the command failed" (1) from "the user typed
+		// it wrong" (2) is hard to do generically with cobra, since
+		// SilenceUsage suppresses both. Settle on 1; pflag errors
+		// for unknown flags come through the same RunE path with a
+		// recognisable wrap, but the cost of mislabelling them as a
+		// runtime error vs a usage error is small.
+		return 1
 	}
-	switch args[0] {
-	case "listen":
-		return runListen(args[1:])
-	case "connect":
-		return runConnect(args[1:])
-	case "status":
-		return runStatus(args[1:])
-	case "channel":
-		return runChannel(args[1:])
-	case "shutdown":
-		return runShutdown(args[1:])
-	case "completion":
-		return runCompletion(args[1:])
-	case "help", "-h", "--help":
-		usage(os.Stdout)
-		return 0
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n", args[0])
-		usage(os.Stderr)
-		return 2
-	}
+	return 0
 }
 
-func usage(w io.Writer) {
-	fmt.Fprintf(w, `bidichan — DPI-resistant bidirectional transport (TLS 1.2 + SNI)
+func newRootCmd() *cobra.Command {
+	root := &cobra.Command{
+		Use:   "bidichan",
+		Short: "DPI-resistant bidirectional transport (TLS 1.2 + SNI)",
+		Long: `bidichan establishes a long-lived peer link wrapped in TLS 1.2 with SNI,
+authenticated by a pre-shared key.  After authentication both peers are
+equal: either side can open or close channels (port-forwarding, HTTP/
+SOCKS5 proxies, TUN devices) on the other end.
 
-Commands:
-  listen   --addr HOST:PORT --hostname NAME --psk HEX [--cert FILE --key FILE] [--socket PATH]
-           listen --unix-socket PATH --hostname NAME --psk HEX [--socket PATH]
-           listen [<profile>] [--config NAME-OR-PATH] [flag overrides...]
-              Run as the server end. Accepts authenticated peers; serves an
-              nginx decoy to everyone else (in TLS mode). With --unix-socket
-              the daemon binds a unix socket and skips TLS, expecting a
-              reverse proxy (e.g. nginx) to terminate TLS in front.
+Wrong SNI / wrong PSK / wrong path → nginx default HTML and disconnect.
 
-  connect  --addr HOST:PORT --hostname NAME --psk HEX [--socket PATH]
-              [--no-tls-binding]
-           connect --unix-socket PATH --hostname NAME --psk HEX
-           connect [<profile>] [--config NAME-OR-PATH] [flag overrides...]
-              Run as the dialing end. Establishes one peer to the server.
-              Pass --no-tls-binding when the server is behind a
-              TLS-terminating reverse proxy (binding cannot be shared).
-
-  Config files (listen and connect): a profile name resolves to
-  $XDG_CONFIG_HOME/bidichan/<name>.conf, then /etc/bidichan/<name>.conf.
-  The file is key=value text ('#' starts a comment) with the same key
-  names as the CLI flags (without --). CLI flags override file values.
-  Use --psk-file PATH to keep the secret in a separate file.
-
-  status   [--socket PATH]
-              Show running peers and open channels on the local daemon.
-
-  channel  open  forward  [--peer ID] [--listen-side local|remote]
-                          [-L LADDR:RHOST:RPORT | -R LADDR:RHOST:RPORT]
-                          [--listen-addr H:P --target H:P]
-           open  http     [--peer ID] [--listen-side local|remote] --listen H:P
-           open  socks5   [--peer ID] [--listen-side local|remote] --listen H:P
-           open  tun      [--peer ID] [--tun-side local|remote] [--name N]
-                          [--cidr 10.42.0.1/24] [--mtu 1400]
-           close          [--peer ID] --id CHANNEL_ID
-
-  shutdown [--socket PATH]
-              Ask the local daemon to exit.
-
-  completion bash|zsh|fish
-              Emit a shell completion script to stdout. Completes
-              subcommands, flags, and profile names from
-              $XDG_CONFIG_HOME/bidichan and /etc/bidichan.
-              Install (bash):  source <(bidichan completion bash)
-              Install (zsh):   bidichan completion zsh > "${fpath[1]}/_bidichan"
-              Install (fish):  bidichan completion fish > ~/.config/fish/completions/bidichan.fish
-
-Auth: --psk is a hex-encoded pre-shared key. Both sides must use the same value.
-SNI:  --hostname is sent as TLS SNI and Host: header; server enforces equality.
-      Wrong SNI / wrong PSK / wrong path -> nginx default HTML and disconnect.
-`)
+Both --psk and --hostname are required on listen and connect; supply them
+inline, via --psk-file PATH, or via a peer config profile (see the
+"Config files (profiles)" section in the README).`,
+		SilenceUsage:  true,
+		SilenceErrors: false,
+	}
+	root.AddCommand(
+		newListenCmd(),
+		newConnectCmd(),
+		newStatusCmd(),
+		newChannelCmd(),
+		newShutdownCmd(),
+	)
+	return root
 }
 
 // --- listen ---
 
-func runListen(args []string) int {
-	positional, args := peelProfileArg(args)
-	fs := flag.NewFlagSet("listen", flag.ExitOnError)
-	configSrc := fs.String("config", "", "profile name or path to a config file (key=value); CLI flags override the file")
-	addr := fs.String("addr", ":443", "TCP listen address (host:port). Ignored if --unix-socket is set.")
-	unixPath := fs.String("unix-socket", "", "listen on a unix socket and skip TLS — for behind-nginx deployments")
-	hostname := fs.String("hostname", "", "SNI hostname to require (and Host: header in plain mode)")
-	pskHex := fs.String("psk", "", "pre-shared key (hex)")
-	pskFile := fs.String("psk-file", "", "file containing the hex PSK on a single line")
-	certPath := fs.String("cert", "", "TLS certificate PEM (optional; self-signed if absent). Ignored in unix-socket mode.")
-	keyPath := fs.String("key", "", "TLS key PEM (optional). Ignored in unix-socket mode.")
-	sock := fs.String("socket", "", "local CLI control socket path (default XDG_RUNTIME_DIR/bidichan-<pid>.sock)")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	logger := log.New(os.Stderr, "bidichan ", log.LstdFlags|log.Lmicroseconds)
+func newListenCmd() *cobra.Command {
+	var (
+		configSrc string
+		addr      string
+		unixPath  string
+		hostname  string
+		pskHex    string
+		pskFile   string
+		certPath  string
+		keyPath   string
+		sock      string
+	)
+	cmd := &cobra.Command{
+		Use:   "listen [<profile>]",
+		Short: "Run as the server end",
+		Long: `Run as the server end.
 
-	source, err := profileSourceFrom(positional, *configSrc, "listen")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
-	}
-	if path, err := applyProfile(fs, source, logger); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	} else if path != "" {
-		logger.Printf("loaded profile %s", path)
-	}
+Accepts authenticated peers; serves an nginx decoy to everyone else
+(in TLS mode). With --unix-socket the daemon binds a unix socket and
+skips TLS, expecting a reverse proxy (e.g. nginx) to terminate TLS
+in front. An optional positional profile name (or --config name|path)
+loads connection settings from $XDG_CONFIG_HOME/bidichan/<name>.conf
+or /etc/bidichan/<name>.conf.`,
+		Args: cobra.MaximumNArgs(1),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) > 0 {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+			return ListProfileNames(), cobra.ShellCompDirectiveNoFileComp
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			positional := ""
+			if len(args) > 0 {
+				positional = args[0]
+			}
+			logger := log.New(os.Stderr, "bidichan ", log.LstdFlags|log.Lmicroseconds)
 
-	if *pskHex == "" && *pskFile != "" {
-		hexStr, err := readPSKFile(*pskFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "read --psk-file: %v\n", err)
-			return 1
-		}
-		*pskHex = hexStr
-	}
-	if *hostname == "" || *pskHex == "" {
-		fmt.Fprintln(os.Stderr, "listen: --hostname and --psk (or --psk-file / config) are required")
-		return 2
-	}
-	psk, err := hex.DecodeString(*pskHex)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "bad PSK: %v\n", err)
-		return 2
-	}
+			source, err := profileSourceFrom(positional, configSrc, "listen")
+			if err != nil {
+				return err
+			}
+			if path, err := applyProfile(cmd.Flags(), source, logger); err != nil {
+				return err
+			} else if path != "" {
+				logger.Printf("loaded profile %s", path)
+			}
 
-	bindAddr := *addr
-	network := "tcp"
-	if *unixPath != "" {
-		bindAddr = *unixPath
-		network = "unix"
-	}
+			if pskHex == "" && pskFile != "" {
+				h, err := readPSKFile(pskFile)
+				if err != nil {
+					return fmt.Errorf("read --psk-file: %w", err)
+				}
+				pskHex = h
+			}
+			if hostname == "" || pskHex == "" {
+				return errors.New("listen: --hostname and --psk (or --psk-file / config) are required")
+			}
+			psk, err := hex.DecodeString(pskHex)
+			if err != nil {
+				return fmt.Errorf("bad PSK: %w", err)
+			}
 
-	d, err := daemon.New(daemon.Config{
-		Mode:             daemon.ModeListen,
-		BindAddr:         bindAddr,
-		Hostname:         *hostname,
-		PSK:              psk,
-		CertPath:         *certPath,
-		KeyPath:          *keyPath,
-		TransportNetwork: network,
-		ControlSocket:    *sock,
-		Logger:           logger,
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+			bindAddr := addr
+			network := "tcp"
+			if unixPath != "" {
+				bindAddr = unixPath
+				network = "unix"
+			}
+
+			d, err := daemon.New(daemon.Config{
+				Mode:             daemon.ModeListen,
+				BindAddr:         bindAddr,
+				Hostname:         hostname,
+				PSK:              psk,
+				CertPath:         certPath,
+				KeyPath:          keyPath,
+				TransportNetwork: network,
+				ControlSocket:    sock,
+				Logger:           logger,
+			})
+			if err != nil {
+				return err
+			}
+			return runDaemon(cmd.Context(), d, logger)
+		},
 	}
-	return runDaemon(d, logger)
+	f := cmd.Flags()
+	f.StringVar(&configSrc, "config", "", "profile name or path to a config file; CLI flags override the file")
+	f.StringVar(&addr, "addr", ":443", "TCP listen address (host:port); ignored if --unix-socket is set")
+	f.StringVar(&unixPath, "unix-socket", "", "listen on a unix socket and skip TLS — for behind-nginx deployments")
+	f.StringVar(&hostname, "hostname", "", "SNI hostname to require (and Host: header in plain mode)")
+	f.StringVar(&pskHex, "psk", "", "pre-shared key (hex)")
+	f.StringVar(&pskFile, "psk-file", "", "file containing the hex PSK on a single line")
+	f.StringVar(&certPath, "cert", "", "TLS certificate PEM (self-signed if absent); ignored in unix-socket mode")
+	f.StringVar(&keyPath, "key", "", "TLS key PEM; ignored in unix-socket mode")
+	f.StringVar(&sock, "socket", "", "local CLI control socket path (default $XDG_RUNTIME_DIR/bidichan-<pid>.sock)")
+
+	_ = cmd.RegisterFlagCompletionFunc("config", profileFlagCompletion)
+	return cmd
 }
 
 // --- connect ---
 
-func runConnect(args []string) int {
-	positional, args := peelProfileArg(args)
-	fs := flag.NewFlagSet("connect", flag.ExitOnError)
-	configSrc := fs.String("config", "", "profile name or path to a config file (key=value); CLI flags override the file")
-	addr := fs.String("addr", "", "remote address (host:port). Ignored if --unix-socket is set.")
-	unixPath := fs.String("unix-socket", "", "dial a local unix socket and skip TLS — for behind-nginx testing")
-	hostname := fs.String("hostname", "", "SNI hostname to send and require")
-	pskHex := fs.String("psk", "", "pre-shared key (hex)")
-	pskFile := fs.String("psk-file", "", "file containing the hex PSK on a single line")
-	noBind := fs.Bool("no-tls-binding", false, "omit the TLS-unique channel binding from auth — required when the server is behind a TLS-terminating reverse proxy")
-	sock := fs.String("socket", "", "local CLI control socket path")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	logger := log.New(os.Stderr, "bidichan ", log.LstdFlags|log.Lmicroseconds)
+func newConnectCmd() *cobra.Command {
+	var (
+		configSrc string
+		addr      string
+		unixPath  string
+		hostname  string
+		pskHex    string
+		pskFile   string
+		noBind    bool
+		sock      string
+	)
+	cmd := &cobra.Command{
+		Use:   "connect [<profile>]",
+		Short: "Run as the dialing end",
+		Long: `Run as the dialing end. Establishes one peer to the server.
 
-	source, err := profileSourceFrom(positional, *configSrc, "connect")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
-	}
-	if path, err := applyProfile(fs, source, logger); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	} else if path != "" {
-		logger.Printf("loaded profile %s", path)
-	}
+Pass --no-tls-binding when the server is behind a TLS-terminating
+reverse proxy (binding cannot be shared). An optional positional
+profile name (or --config name|path) loads connection settings from
+$XDG_CONFIG_HOME/bidichan/<name>.conf or /etc/bidichan/<name>.conf.`,
+		Args: cobra.MaximumNArgs(1),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) > 0 {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+			return ListProfileNames(), cobra.ShellCompDirectiveNoFileComp
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			positional := ""
+			if len(args) > 0 {
+				positional = args[0]
+			}
+			logger := log.New(os.Stderr, "bidichan ", log.LstdFlags|log.Lmicroseconds)
 
-	if *pskHex == "" && *pskFile != "" {
-		hexStr, err := readPSKFile(*pskFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "read --psk-file: %v\n", err)
-			return 1
-		}
-		*pskHex = hexStr
-	}
-	if *hostname == "" || *pskHex == "" {
-		fmt.Fprintln(os.Stderr, "connect: --hostname and --psk (or --psk-file / config) are required")
-		return 2
-	}
-	remote := *addr
-	network := "tcp"
-	if *unixPath != "" {
-		remote = *unixPath
-		network = "unix"
-	}
-	if remote == "" {
-		fmt.Fprintln(os.Stderr, "connect: --addr or --unix-socket is required")
-		return 2
-	}
-	psk, err := hex.DecodeString(*pskHex)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "bad PSK: %v\n", err)
-		return 2
-	}
+			source, err := profileSourceFrom(positional, configSrc, "connect")
+			if err != nil {
+				return err
+			}
+			if path, err := applyProfile(cmd.Flags(), source, logger); err != nil {
+				return err
+			} else if path != "" {
+				logger.Printf("loaded profile %s", path)
+			}
 
-	d, err := daemon.New(daemon.Config{
-		Mode:             daemon.ModeConnect,
-		RemoteAddr:       remote,
-		Hostname:         *hostname,
-		PSK:              psk,
-		TransportNetwork: network,
-		SkipBinding:      *noBind,
-		ControlSocket:    *sock,
-		Logger:           logger,
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+			if pskHex == "" && pskFile != "" {
+				h, err := readPSKFile(pskFile)
+				if err != nil {
+					return fmt.Errorf("read --psk-file: %w", err)
+				}
+				pskHex = h
+			}
+			if hostname == "" || pskHex == "" {
+				return errors.New("connect: --hostname and --psk (or --psk-file / config) are required")
+			}
+			remote := addr
+			network := "tcp"
+			if unixPath != "" {
+				remote = unixPath
+				network = "unix"
+			}
+			if remote == "" {
+				return errors.New("connect: --addr or --unix-socket is required")
+			}
+			psk, err := hex.DecodeString(pskHex)
+			if err != nil {
+				return fmt.Errorf("bad PSK: %w", err)
+			}
+
+			d, err := daemon.New(daemon.Config{
+				Mode:             daemon.ModeConnect,
+				RemoteAddr:       remote,
+				Hostname:         hostname,
+				PSK:              psk,
+				TransportNetwork: network,
+				SkipBinding:      noBind,
+				ControlSocket:    sock,
+				Logger:           logger,
+			})
+			if err != nil {
+				return err
+			}
+			return runDaemon(cmd.Context(), d, logger)
+		},
 	}
-	return runDaemon(d, logger)
+	f := cmd.Flags()
+	f.StringVar(&configSrc, "config", "", "profile name or path to a config file; CLI flags override the file")
+	f.StringVar(&addr, "addr", "", "remote address (host:port); ignored if --unix-socket is set")
+	f.StringVar(&unixPath, "unix-socket", "", "dial a local unix socket and skip TLS — for behind-nginx testing")
+	f.StringVar(&hostname, "hostname", "", "SNI hostname to send and require")
+	f.StringVar(&pskHex, "psk", "", "pre-shared key (hex)")
+	f.StringVar(&pskFile, "psk-file", "", "file containing the hex PSK on a single line")
+	f.BoolVar(&noBind, "no-tls-binding", false, "omit the TLS-unique channel binding from auth — required when the server is behind a TLS-terminating reverse proxy")
+	f.StringVar(&sock, "socket", "", "local CLI control socket path")
+
+	_ = cmd.RegisterFlagCompletionFunc("config", profileFlagCompletion)
+	return cmd
 }
 
-func runDaemon(d *daemon.Daemon, logger *log.Logger) int {
-	ctx, cancel := context.WithCancel(context.Background())
+// runDaemon runs the long-lived listen/connect daemon, watches for
+// SIGINT/SIGTERM, and tears down cleanly. Returns nil on a clean
+// shutdown (including signal) so cobra exits 0; surfaces real failures
+// as errors.
+func runDaemon(parent context.Context, d *daemon.Daemon, logger *log.Logger) error {
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	go func() {
-		<-sigCh
-		logger.Printf("signal received, shutting down")
-		_ = d.Close()
-		cancel()
+		select {
+		case <-sigCh:
+			logger.Printf("signal received, shutting down")
+			_ = d.Close()
+			cancel()
+		case <-ctx.Done():
+		}
 	}()
 	if err := d.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		logger.Printf("daemon: %v", err)
-		return 1
+		return err
 	}
-	return 0
+	return nil
 }
 
 // --- status ---
 
-func runStatus(args []string) int {
-	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	sock := fs.String("socket", "", "daemon control socket path (auto-discovered if empty)")
-	jsonOut := fs.Bool("json", false, "emit JSON")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	c, err := DialCtrl(*sock)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	defer c.Close()
-	data, err := c.Call(daemon.ActionStatus, nil)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	if *jsonOut {
-		os.Stdout.Write(data)
-		os.Stdout.Write([]byte("\n"))
-		return 0
-	}
-	var resp daemon.StatusResponse
-	if err := json.Unmarshal(data, &resp); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "PEER\tMODE\tREMOTE\tLOCAL\tUP")
-	for _, p := range resp.Peers {
-		uptime := time.Since(p.StartedAt).Truncate(time.Second)
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", p.ID, p.Mode, p.Remote, p.Local, uptime)
-	}
-	tw.Flush()
-	for _, p := range resp.Peers {
-		if len(p.Channels) == 0 {
-			continue
-		}
-		fmt.Printf("\nChannels on peer %s:\n", p.ID)
-		ctw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(ctw, "  ID\tKIND\tROLE\tDESCRIPTION")
-		for _, ch := range p.Channels {
-			role := "accepted"
-			if ch.Originator {
-				role = "originated"
+func newStatusCmd() *cobra.Command {
+	var (
+		sock    string
+		jsonOut bool
+	)
+	cmd := &cobra.Command{
+		Use:   "status",
+		Short: "Show running peers and open channels on the local daemon",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := DialCtrl(sock)
+			if err != nil {
+				return err
 			}
-			fmt.Fprintf(ctw, "  %d\t%s\t%s\t%s\n", ch.ID, ch.Kind, role, ch.Description)
-		}
-		ctw.Flush()
+			defer c.Close()
+			data, err := c.Call(daemon.ActionStatus, nil)
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				_, _ = os.Stdout.Write(data)
+				_, _ = os.Stdout.Write([]byte("\n"))
+				return nil
+			}
+			var resp daemon.StatusResponse
+			if err := json.Unmarshal(data, &resp); err != nil {
+				return err
+			}
+			tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(tw, "PEER\tMODE\tREMOTE\tLOCAL\tUP")
+			for _, p := range resp.Peers {
+				uptime := time.Since(p.StartedAt).Truncate(time.Second)
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", p.ID, p.Mode, p.Remote, p.Local, uptime)
+			}
+			tw.Flush()
+			for _, p := range resp.Peers {
+				if len(p.Channels) == 0 {
+					continue
+				}
+				fmt.Printf("\nChannels on peer %s:\n", p.ID)
+				ctw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(ctw, "  ID\tKIND\tROLE\tDESCRIPTION")
+				for _, ch := range p.Channels {
+					role := "accepted"
+					if ch.Originator {
+						role = "originated"
+					}
+					fmt.Fprintf(ctw, "  %d\t%s\t%s\t%s\n", ch.ID, ch.Kind, role, ch.Description)
+				}
+				ctw.Flush()
+			}
+			return nil
+		},
 	}
-	return 0
+	cmd.Flags().StringVar(&sock, "socket", "", "daemon control socket path (auto-discovered if empty)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSON")
+	return cmd
+}
+
+// --- shutdown ---
+
+func newShutdownCmd() *cobra.Command {
+	var sock string
+	cmd := &cobra.Command{
+		Use:   "shutdown",
+		Short: "Ask the local daemon to exit",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := DialCtrl(sock)
+			if err != nil {
+				return err
+			}
+			defer c.Close()
+			if _, err := c.Call(daemon.ActionShutdown, nil); err != nil {
+				return err
+			}
+			fmt.Println("shutdown requested")
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&sock, "socket", "", "daemon control socket path")
+	return cmd
 }
 
 // --- channel ---
 
-func runChannel(args []string) int {
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "channel: missing subcommand (open|close)")
-		return 2
+func newChannelCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "channel",
+		Short: "Open or close a channel on an established peer",
 	}
-	switch args[0] {
-	case "open":
-		return runChannelOpen(args[1:])
-	case "close":
-		return runChannelClose(args[1:])
-	}
-	fmt.Fprintf(os.Stderr, "channel: unknown subcommand %q\n", args[0])
-	return 2
+	cmd.AddCommand(newChannelOpenCmd(), newChannelCloseCmd())
+	return cmd
 }
 
-func runChannelOpen(args []string) int {
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "channel open: missing kind (forward|http|socks5|tun)")
-		return 2
+func newChannelOpenCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "open",
+		Short: "Open a forward / http / socks5 / tun channel",
 	}
-	switch args[0] {
-	case "forward":
-		return runOpenForward(args[1:])
-	case "http":
-		return runOpenProxy(args[1:], daemon.ActionOpenHTTP)
-	case "socks5":
-		return runOpenProxy(args[1:], daemon.ActionOpenSocks5)
-	case "tun":
-		return runOpenTUN(args[1:])
-	}
-	fmt.Fprintf(os.Stderr, "channel open: unknown kind %q\n", args[0])
-	return 2
+	cmd.AddCommand(
+		newChannelOpenForwardCmd(),
+		newChannelOpenProxyCmd("http", daemon.ActionOpenHTTP),
+		newChannelOpenProxyCmd("socks5", daemon.ActionOpenSocks5),
+		newChannelOpenTUNCmd(),
+	)
+	return cmd
 }
 
-func runOpenForward(args []string) int {
-	fs := flag.NewFlagSet("channel open forward", flag.ExitOnError)
-	sock := fs.String("socket", "", "daemon socket")
-	peerID := fs.String("peer", "", "peer id (prefix ok)")
-	side := fs.String("listen-side", "", "local|remote — which side hosts the listener")
-	listenAddr := fs.String("listen-addr", "", "listener address host:port")
-	targetAddr := fs.String("target", "", "target address host:port")
-	label := fs.String("label", "", "human label")
-	short := fs.String("L", "", "SSH-style direct forward LADDR:RHOST:RPORT (listener on local)")
-	shortR := fs.String("R", "", "SSH-style reverse forward LADDR:RHOST:RPORT (listener on remote)")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
+func newChannelOpenForwardCmd() *cobra.Command {
+	var (
+		sock       string
+		peerID     string
+		side       string
+		listenAddr string
+		targetAddr string
+		label      string
+		short      string
+		shortR     string
+	)
+	cmd := &cobra.Command{
+		Use:   "forward",
+		Short: "Direct (-L) or reverse (-R) TCP port forwarding",
+		Long: `Open a TCP forwarding channel.
 
-	if *short != "" || *shortR != "" {
-		val := *short
-		ls := "local"
-		if *shortR != "" {
-			val = *shortR
-			ls = "remote"
-		}
-		la, ta, err := parseSSHForward(val)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 2
-		}
-		*listenAddr = la
-		*targetAddr = ta
-		*side = ls
+The two short forms mirror SSH:
+  -L LADDR:RHOST:RPORT   listen on the local side, dial through peer
+  -R LADDR:RHOST:RPORT   listen on the peer side, dial through local
+The long form takes --listen-side {local|remote}, --listen-addr, and
+--target as separate values.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if short != "" || shortR != "" {
+				val := short
+				ls := "local"
+				if shortR != "" {
+					val = shortR
+					ls = "remote"
+				}
+				la, ta, err := parseSSHForward(val)
+				if err != nil {
+					return err
+				}
+				listenAddr = la
+				targetAddr = ta
+				side = ls
+			}
+			if side == "" || listenAddr == "" || targetAddr == "" {
+				return errors.New("need --listen-side, --listen-addr, --target (or use -L/-R)")
+			}
+			c, err := DialCtrl(sock)
+			if err != nil {
+				return err
+			}
+			defer c.Close()
+			data, err := c.Call(daemon.ActionOpenForward, daemon.OpenForwardArgs{
+				PeerID:     peerID,
+				ListenSide: side,
+				ListenAddr: listenAddr,
+				TargetAddr: targetAddr,
+				Label:      label,
+			})
+			if err != nil {
+				return err
+			}
+			var resp daemon.OpenResponse
+			_ = json.Unmarshal(data, &resp)
+			fmt.Printf("opened forward channel id=%d\n", resp.ChannelID)
+			return nil
+		},
 	}
-
-	if *side == "" || *listenAddr == "" || *targetAddr == "" {
-		fmt.Fprintln(os.Stderr, "need --listen-side, --listen-addr, --target (or use -L/-R)")
-		return 2
-	}
-
-	c, err := DialCtrl(*sock)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	defer c.Close()
-	data, err := c.Call(daemon.ActionOpenForward, daemon.OpenForwardArgs{
-		PeerID:     *peerID,
-		ListenSide: *side,
-		ListenAddr: *listenAddr,
-		TargetAddr: *targetAddr,
-		Label:      *label,
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	var resp daemon.OpenResponse
-	_ = json.Unmarshal(data, &resp)
-	fmt.Printf("opened forward channel id=%d\n", resp.ChannelID)
-	return 0
+	f := cmd.Flags()
+	f.StringVar(&sock, "socket", "", "daemon socket")
+	f.StringVar(&peerID, "peer", "", "peer id (prefix ok)")
+	f.StringVar(&side, "listen-side", "", "local|remote — which side hosts the listener")
+	f.StringVar(&listenAddr, "listen-addr", "", "listener address host:port")
+	f.StringVar(&targetAddr, "target", "", "target address host:port")
+	f.StringVar(&label, "label", "", "human label")
+	f.StringVarP(&short, "L", "L", "", "SSH-style direct forward LADDR:RHOST:RPORT (listener on local)")
+	f.StringVarP(&shortR, "R", "R", "", "SSH-style reverse forward LADDR:RHOST:RPORT (listener on remote)")
+	_ = cmd.RegisterFlagCompletionFunc("listen-side", localRemoteCompletion)
+	return cmd
 }
 
-func runOpenProxy(args []string, action string) int {
-	fs := flag.NewFlagSet("channel open proxy", flag.ExitOnError)
-	sock := fs.String("socket", "", "daemon socket")
-	peerID := fs.String("peer", "", "peer id (prefix ok)")
-	side := fs.String("listen-side", "local", "local|remote — which side hosts the proxy listener")
-	listenAddr := fs.String("listen", "", "listener address host:port")
-	label := fs.String("label", "", "human label")
-	if err := fs.Parse(args); err != nil {
-		return 2
+func newChannelOpenProxyCmd(kind, action string) *cobra.Command {
+	var (
+		sock       string
+		peerID     string
+		side       string
+		listenAddr string
+		label      string
+	)
+	cmd := &cobra.Command{
+		Use:   kind,
+		Short: "Run an " + kind + " proxy frontend on the chosen side",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if listenAddr == "" {
+				return errors.New("need --listen")
+			}
+			c, err := DialCtrl(sock)
+			if err != nil {
+				return err
+			}
+			defer c.Close()
+			data, err := c.Call(action, daemon.OpenProxyArgs{
+				PeerID:     peerID,
+				ListenSide: side,
+				ListenAddr: listenAddr,
+				Label:      label,
+			})
+			if err != nil {
+				return err
+			}
+			var resp daemon.OpenResponse
+			_ = json.Unmarshal(data, &resp)
+			fmt.Printf("opened %s channel id=%d\n", kind, resp.ChannelID)
+			return nil
+		},
 	}
-	if *listenAddr == "" {
-		fmt.Fprintln(os.Stderr, "need --listen")
-		return 2
-	}
-	c, err := DialCtrl(*sock)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	defer c.Close()
-	data, err := c.Call(action, daemon.OpenProxyArgs{
-		PeerID:     *peerID,
-		ListenSide: *side,
-		ListenAddr: *listenAddr,
-		Label:      *label,
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	var resp daemon.OpenResponse
-	_ = json.Unmarshal(data, &resp)
-	fmt.Printf("opened %s channel id=%d\n", strings.TrimPrefix(action, "open_"), resp.ChannelID)
-	return 0
+	f := cmd.Flags()
+	f.StringVar(&sock, "socket", "", "daemon socket")
+	f.StringVar(&peerID, "peer", "", "peer id (prefix ok)")
+	f.StringVar(&side, "listen-side", "local", "local|remote — which side hosts the proxy listener")
+	f.StringVar(&listenAddr, "listen", "", "listener address host:port")
+	f.StringVar(&label, "label", "", "human label")
+	_ = cmd.RegisterFlagCompletionFunc("listen-side", localRemoteCompletion)
+	return cmd
 }
 
-func runOpenTUN(args []string) int {
-	fs := flag.NewFlagSet("channel open tun", flag.ExitOnError)
-	sock := fs.String("socket", "", "daemon socket")
-	peerID := fs.String("peer", "", "peer id (prefix ok)")
-	side := fs.String("tun-side", "local", "local|remote — which side names the device")
-	name := fs.String("name", "", "device name (Linux only)")
-	cidr := fs.String("cidr", "", "IP/CIDR to assign (Linux only)")
-	mtu := fs.Int("mtu", 1400, "MTU")
-	label := fs.String("label", "", "human label")
-	if err := fs.Parse(args); err != nil {
-		return 2
+func newChannelOpenTUNCmd() *cobra.Command {
+	var (
+		sock   string
+		peerID string
+		side   string
+		name   string
+		cidr   string
+		mtu    int
+		label  string
+	)
+	cmd := &cobra.Command{
+		Use:   "tun",
+		Short: "Create a TUN device on the chosen side",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := DialCtrl(sock)
+			if err != nil {
+				return err
+			}
+			defer c.Close()
+			data, err := c.Call(daemon.ActionOpenTUN, daemon.OpenTUNArgs{
+				PeerID:  peerID,
+				TUNSide: side,
+				Name:    name,
+				CIDR:    cidr,
+				MTU:     mtu,
+				Label:   label,
+			})
+			if err != nil {
+				return err
+			}
+			var resp daemon.OpenResponse
+			_ = json.Unmarshal(data, &resp)
+			fmt.Printf("opened tun channel id=%d\n", resp.ChannelID)
+			return nil
+		},
 	}
-	c, err := DialCtrl(*sock)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	defer c.Close()
-	data, err := c.Call(daemon.ActionOpenTUN, daemon.OpenTUNArgs{
-		PeerID:  *peerID,
-		TUNSide: *side,
-		Name:    *name,
-		CIDR:    *cidr,
-		MTU:     *mtu,
-		Label:   *label,
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	var resp daemon.OpenResponse
-	_ = json.Unmarshal(data, &resp)
-	fmt.Printf("opened tun channel id=%d\n", resp.ChannelID)
-	return 0
+	f := cmd.Flags()
+	f.StringVar(&sock, "socket", "", "daemon socket")
+	f.StringVar(&peerID, "peer", "", "peer id (prefix ok)")
+	f.StringVar(&side, "tun-side", "local", "local|remote — which side names the device")
+	f.StringVar(&name, "name", "", "device name (Linux only)")
+	f.StringVar(&cidr, "cidr", "", "IP/CIDR to assign (Linux only)")
+	f.IntVar(&mtu, "mtu", 1400, "MTU")
+	f.StringVar(&label, "label", "", "human label")
+	_ = cmd.RegisterFlagCompletionFunc("tun-side", localRemoteCompletion)
+	return cmd
 }
 
-func runChannelClose(args []string) int {
-	fs := flag.NewFlagSet("channel close", flag.ExitOnError)
-	sock := fs.String("socket", "", "daemon socket")
-	peerID := fs.String("peer", "", "peer id (prefix ok)")
-	chID := fs.Uint64("id", 0, "channel id")
-	if err := fs.Parse(args); err != nil {
-		return 2
+func newChannelCloseCmd() *cobra.Command {
+	var (
+		sock   string
+		peerID string
+		chID   uint64
+	)
+	cmd := &cobra.Command{
+		Use:   "close",
+		Short: "Close a channel by id",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if chID == 0 {
+				return errors.New("need --id")
+			}
+			c, err := DialCtrl(sock)
+			if err != nil {
+				return err
+			}
+			defer c.Close()
+			if _, err := c.Call(daemon.ActionClose, daemon.CloseArgs{PeerID: peerID, ChannelID: chID}); err != nil {
+				return err
+			}
+			fmt.Printf("closed channel %d\n", chID)
+			return nil
+		},
 	}
-	if *chID == 0 {
-		fmt.Fprintln(os.Stderr, "need --id")
-		return 2
-	}
-	c, err := DialCtrl(*sock)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	defer c.Close()
-	if _, err := c.Call(daemon.ActionClose, daemon.CloseArgs{PeerID: *peerID, ChannelID: *chID}); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	fmt.Printf("closed channel %d\n", *chID)
-	return 0
+	f := cmd.Flags()
+	f.StringVar(&sock, "socket", "", "daemon socket")
+	f.StringVar(&peerID, "peer", "", "peer id (prefix ok)")
+	f.Uint64Var(&chID, "id", 0, "channel id")
+	return cmd
 }
 
-func runShutdown(args []string) int {
-	fs := flag.NewFlagSet("shutdown", flag.ExitOnError)
-	sock := fs.String("socket", "", "daemon socket")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	c, err := DialCtrl(*sock)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	defer c.Close()
-	if _, err := c.Call(daemon.ActionShutdown, nil); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	fmt.Println("shutdown requested")
-	return 0
+// --- shared completion helpers ---
+
+// profileFlagCompletion is wired to the --config flag on listen and
+// connect; it returns the same profile name list ValidArgsFunction
+// returns for the positional, plus file completion (since --config
+// also accepts a literal path).
+func profileFlagCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	names := ListProfileNames()
+	// cobra mixes ShellCompDirectiveDefault (file completion) into
+	// suggestions automatically for string flags; returning the
+	// profile names alongside that gives the operator both.
+	return names, cobra.ShellCompDirectiveDefault
 }
 
-// parseSSHForward parses "LADDR:RHOST:RPORT" into (listenAddr, targetAddr).
-// LADDR may be "8080" (binds 127.0.0.1:8080), ":8080" (all interfaces), or
-// "host:8080".
+func localRemoteCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	return []string{"local", "remote"}, cobra.ShellCompDirectiveNoFileComp
+}
+
+// parseSSHForward parses "LADDR:RHOST:RPORT" (3 tokens) or
+// "LHOST:LPORT:RHOST:RPORT" (4 tokens) into (listenAddr, targetAddr).
 func parseSSHForward(s string) (listen, target string, err error) {
 	parts := strings.Split(s, ":")
 	switch len(parts) {
 	case 3:
-		// LPORT:RHOST:RPORT  -> 127.0.0.1:LPORT  RHOST:RPORT
 		return "127.0.0.1:" + parts[0], parts[1] + ":" + parts[2], nil
 	case 4:
-		// LHOST:LPORT:RHOST:RPORT
 		return parts[0] + ":" + parts[1], parts[2] + ":" + parts[3], nil
 	}
 	return "", "", fmt.Errorf("invalid forward spec %q", s)
 }
+
+// silence "imported and not used" in case future refactors drop one of
+// these standard libs.
+var (
+	_ = io.Discard
+	_ = strconv.Itoa
+)
