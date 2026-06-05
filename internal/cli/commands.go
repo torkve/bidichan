@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/torkve/bidichan/internal/daemon"
 )
@@ -200,6 +201,7 @@ func newConnectCmd() *cobra.Command {
 		sock      string
 		wsPath    string
 		caCert    string
+		channels  []string
 	)
 	cmd := &cobra.Command{
 		Use:   "connect [<profile>]",
@@ -258,6 +260,15 @@ $XDG_CONFIG_HOME/bidichan/<name>.conf or /etc/bidichan/<name>.conf.`,
 				return fmt.Errorf("bad PSK: %w", err)
 			}
 
+			autoChannels := make([]daemon.AutoChannel, 0, len(channels))
+			for _, spec := range channels {
+				ac, err := parseAutoChannel(spec)
+				if err != nil {
+					return err
+				}
+				autoChannels = append(autoChannels, ac)
+			}
+
 			d, err := daemon.New(daemon.Config{
 				Mode:             daemon.ModeConnect,
 				RemoteAddr:       remote,
@@ -267,6 +278,7 @@ $XDG_CONFIG_HOME/bidichan/<name>.conf or /etc/bidichan/<name>.conf.`,
 				SkipBinding:      noBind,
 				Path:             wsPath,
 				CACert:           caCert,
+				AutoChannels:     autoChannels,
 				ControlSocket:    sock,
 				Logger:           logger,
 			})
@@ -286,6 +298,7 @@ $XDG_CONFIG_HOME/bidichan/<name>.conf or /etc/bidichan/<name>.conf.`,
 	f.BoolVar(&noBind, "no-tls-binding", false, "omit the certificate channel binding from auth — required when the server is behind a TLS-terminating reverse proxy")
 	f.StringVar(&wsPath, "path", "", "WebSocket upgrade request path (default: derived from the PSK; must match the server)")
 	f.StringVar(&caCert, "cacert", "", "PEM bundle to verify the server cert against (for self-signed / private CA); default: system trust store")
+	f.StringArrayVar(&channels, "channel", nil, "channel to open once connected, e.g. \"forward -L 8080:host:80\" (repeatable; same syntax as 'channel open')")
 	f.StringVar(&sock, "socket", "", "local CLI control socket path")
 
 	_ = cmd.RegisterFlagCompletionFunc("config", profileFlagCompletion)
@@ -428,14 +441,9 @@ func newChannelOpenCmd() *cobra.Command {
 
 func newChannelOpenForwardCmd() *cobra.Command {
 	var (
-		sock       string
-		peerID     string
-		side       string
-		listenAddr string
-		targetAddr string
-		label      string
-		short      string
-		shortR     string
+		sock   string
+		peerID string
+		def    forwardDef
 	)
 	cmd := &cobra.Command{
 		Use:   "forward",
@@ -448,23 +456,9 @@ The two short forms mirror SSH:
 The long form takes --listen-side {local|remote}, --listen-addr, and
 --target as separate values.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if short != "" || shortR != "" {
-				val := short
-				ls := "local"
-				if shortR != "" {
-					val = shortR
-					ls = "remote"
-				}
-				la, ta, err := parseSSHForward(val)
-				if err != nil {
-					return err
-				}
-				listenAddr = la
-				targetAddr = ta
-				side = ls
-			}
-			if side == "" || listenAddr == "" || targetAddr == "" {
-				return errors.New("need --listen-side, --listen-addr, --target (or use -L/-R)")
+			ac, err := def.build()
+			if err != nil {
+				return err
 			}
 			c, err := DialCtrl(sock)
 			if err != nil {
@@ -473,10 +467,10 @@ The long form takes --listen-side {local|remote}, --listen-addr, and
 			defer c.Close()
 			data, err := c.Call(daemon.ActionOpenForward, daemon.OpenForwardArgs{
 				PeerID:     peerID,
-				ListenSide: side,
-				ListenAddr: listenAddr,
-				TargetAddr: targetAddr,
-				Label:      label,
+				ListenSide: ac.Side,
+				ListenAddr: ac.ListenAddr,
+				TargetAddr: ac.TargetAddr,
+				Label:      ac.Label,
 			})
 			if err != nil {
 				return err
@@ -490,30 +484,24 @@ The long form takes --listen-side {local|remote}, --listen-addr, and
 	f := cmd.Flags()
 	f.StringVar(&sock, "socket", "", "daemon socket")
 	f.StringVar(&peerID, "peer", "", "peer id (prefix ok)")
-	f.StringVar(&side, "listen-side", "", "local|remote — which side hosts the listener")
-	f.StringVar(&listenAddr, "listen-addr", "", "listener address host:port")
-	f.StringVar(&targetAddr, "target", "", "target address host:port")
-	f.StringVar(&label, "label", "", "human label")
-	f.StringVarP(&short, "L", "L", "", "SSH-style direct forward LADDR:RHOST:RPORT (listener on local)")
-	f.StringVarP(&shortR, "R", "R", "", "SSH-style reverse forward LADDR:RHOST:RPORT (listener on remote)")
+	def.register(f)
 	_ = cmd.RegisterFlagCompletionFunc("listen-side", localRemoteCompletion)
 	return cmd
 }
 
 func newChannelOpenProxyCmd(kind, action string) *cobra.Command {
 	var (
-		sock       string
-		peerID     string
-		side       string
-		listenAddr string
-		label      string
+		sock   string
+		peerID string
+		def    proxyDef
 	)
 	cmd := &cobra.Command{
 		Use:   kind,
 		Short: "Run an " + kind + " proxy frontend on the chosen side",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if listenAddr == "" {
-				return errors.New("need --listen")
+			ac, err := def.build(kind)
+			if err != nil {
+				return err
 			}
 			c, err := DialCtrl(sock)
 			if err != nil {
@@ -522,9 +510,9 @@ func newChannelOpenProxyCmd(kind, action string) *cobra.Command {
 			defer c.Close()
 			data, err := c.Call(action, daemon.OpenProxyArgs{
 				PeerID:     peerID,
-				ListenSide: side,
-				ListenAddr: listenAddr,
-				Label:      label,
+				ListenSide: ac.Side,
+				ListenAddr: ac.ListenAddr,
+				Label:      ac.Label,
 			})
 			if err != nil {
 				return err
@@ -538,9 +526,7 @@ func newChannelOpenProxyCmd(kind, action string) *cobra.Command {
 	f := cmd.Flags()
 	f.StringVar(&sock, "socket", "", "daemon socket")
 	f.StringVar(&peerID, "peer", "", "peer id (prefix ok)")
-	f.StringVar(&side, "listen-side", "local", "local|remote — which side hosts the proxy listener")
-	f.StringVar(&listenAddr, "listen", "", "listener address host:port")
-	f.StringVar(&label, "label", "", "human label")
+	def.register(f)
 	_ = cmd.RegisterFlagCompletionFunc("listen-side", localRemoteCompletion)
 	return cmd
 }
@@ -549,16 +535,16 @@ func newChannelOpenTUNCmd() *cobra.Command {
 	var (
 		sock   string
 		peerID string
-		side   string
-		name   string
-		cidr   string
-		mtu    int
-		label  string
+		def    tunDef
 	)
 	cmd := &cobra.Command{
 		Use:   "tun",
 		Short: "Create a TUN device on the chosen side",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			ac, err := def.build()
+			if err != nil {
+				return err
+			}
 			c, err := DialCtrl(sock)
 			if err != nil {
 				return err
@@ -566,11 +552,11 @@ func newChannelOpenTUNCmd() *cobra.Command {
 			defer c.Close()
 			data, err := c.Call(daemon.ActionOpenTUN, daemon.OpenTUNArgs{
 				PeerID:  peerID,
-				TUNSide: side,
-				Name:    name,
-				CIDR:    cidr,
-				MTU:     mtu,
-				Label:   label,
+				TUNSide: ac.Side,
+				Name:    ac.Name,
+				CIDR:    ac.CIDR,
+				MTU:     ac.MTU,
+				Label:   ac.Label,
 			})
 			if err != nil {
 				return err
@@ -584,13 +570,177 @@ func newChannelOpenTUNCmd() *cobra.Command {
 	f := cmd.Flags()
 	f.StringVar(&sock, "socket", "", "daemon socket")
 	f.StringVar(&peerID, "peer", "", "peer id (prefix ok)")
-	f.StringVar(&side, "tun-side", "local", "local|remote — which side names the device")
-	f.StringVar(&name, "name", "", "device name (Linux only)")
-	f.StringVar(&cidr, "cidr", "", "IP/CIDR to assign (Linux only)")
-	f.IntVar(&mtu, "mtu", 1500, "MTU")
-	f.StringVar(&label, "label", "", "human label")
+	def.register(f)
 	_ = cmd.RegisterFlagCompletionFunc("tun-side", localRemoteCompletion)
 	return cmd
+}
+
+// --- shared channel-definition flags + spec parsing ---
+//
+// forwardDef/proxyDef/tunDef hold the channel-*definition* flags shared between
+// `channel open <kind>` and `connect --channel`. They exclude the control-plane
+// flags (--socket/--peer), which only the live subcommands need.
+
+type forwardDef struct {
+	side, listenAddr, targetAddr, label, lFwd, rFwd string
+}
+
+func (d *forwardDef) register(f *pflag.FlagSet) {
+	f.StringVar(&d.side, "listen-side", "", "local|remote — which side hosts the listener")
+	f.StringVar(&d.listenAddr, "listen-addr", "", "listener address host:port")
+	f.StringVar(&d.targetAddr, "target", "", "target address host:port")
+	f.StringVar(&d.label, "label", "", "human label")
+	f.StringVarP(&d.lFwd, "L", "L", "", "SSH-style direct forward LADDR:RHOST:RPORT (listener on local)")
+	f.StringVarP(&d.rFwd, "R", "R", "", "SSH-style reverse forward LADDR:RHOST:RPORT (listener on remote)")
+}
+
+func (d *forwardDef) build() (daemon.AutoChannel, error) {
+	side, la, ta := d.side, d.listenAddr, d.targetAddr
+	if d.lFwd != "" || d.rFwd != "" {
+		val, ls := d.lFwd, "local"
+		if d.rFwd != "" {
+			val, ls = d.rFwd, "remote"
+		}
+		l, t, err := parseSSHForward(val)
+		if err != nil {
+			return daemon.AutoChannel{}, err
+		}
+		side, la, ta = ls, l, t
+	}
+	if side == "" || la == "" || ta == "" {
+		return daemon.AutoChannel{}, errors.New("forward: need -L/-R, or --listen-side, --listen-addr and --target")
+	}
+	return daemon.AutoChannel{Kind: "forward", Side: side, ListenAddr: la, TargetAddr: ta, Label: d.label}, nil
+}
+
+type proxyDef struct {
+	side, listenAddr, label string
+}
+
+func (d *proxyDef) register(f *pflag.FlagSet) {
+	f.StringVar(&d.side, "listen-side", "local", "local|remote — which side hosts the proxy listener")
+	f.StringVar(&d.listenAddr, "listen", "", "listener address host:port")
+	f.StringVar(&d.label, "label", "", "human label")
+}
+
+func (d *proxyDef) build(kind string) (daemon.AutoChannel, error) {
+	if d.listenAddr == "" {
+		return daemon.AutoChannel{}, errors.New(kind + ": need --listen")
+	}
+	return daemon.AutoChannel{Kind: kind, Side: d.side, ListenAddr: d.listenAddr, Label: d.label}, nil
+}
+
+type tunDef struct {
+	side, name, cidr, label string
+	mtu                     int
+}
+
+func (d *tunDef) register(f *pflag.FlagSet) {
+	f.StringVar(&d.side, "tun-side", "local", "local|remote — which side names the device")
+	f.StringVar(&d.name, "name", "", "device name (Linux only)")
+	f.StringVar(&d.cidr, "cidr", "", "IP/CIDR to assign (Linux only)")
+	f.IntVar(&d.mtu, "mtu", 1500, "MTU")
+	f.StringVar(&d.label, "label", "", "human label")
+}
+
+func (d *tunDef) build() (daemon.AutoChannel, error) {
+	return daemon.AutoChannel{Kind: "tun", Side: d.side, Name: d.name, CIDR: d.cidr, MTU: d.mtu, Label: d.label}, nil
+}
+
+// parseAutoChannel parses a `channel open`-style spec string (e.g.
+// `forward -L 8080:host:80`, `socks5 --listen 127.0.0.1:1080`,
+// `tun --cidr 10.0.0.2/24`) into a daemon.AutoChannel. Used by `connect
+// --channel` and the `channel =` config key.
+func parseAutoChannel(spec string) (daemon.AutoChannel, error) {
+	toks, err := splitArgs(spec)
+	if err != nil {
+		return daemon.AutoChannel{}, err
+	}
+	if len(toks) == 0 {
+		return daemon.AutoChannel{}, errors.New("empty channel spec")
+	}
+	kind, rest := toks[0], toks[1:]
+	fs := pflag.NewFlagSet("channel "+kind, pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	wrap := func(err error) error { return fmt.Errorf("channel %q: %w", spec, err) }
+	switch kind {
+	case "forward":
+		var def forwardDef
+		def.register(fs)
+		if err := fs.Parse(rest); err != nil {
+			return daemon.AutoChannel{}, wrap(err)
+		}
+		ac, err := def.build()
+		if err != nil {
+			return daemon.AutoChannel{}, wrap(err)
+		}
+		return ac, nil
+	case "http", "socks5":
+		var def proxyDef
+		def.register(fs)
+		if err := fs.Parse(rest); err != nil {
+			return daemon.AutoChannel{}, wrap(err)
+		}
+		ac, err := def.build(kind)
+		if err != nil {
+			return daemon.AutoChannel{}, wrap(err)
+		}
+		return ac, nil
+	case "tun":
+		var def tunDef
+		def.register(fs)
+		if err := fs.Parse(rest); err != nil {
+			return daemon.AutoChannel{}, wrap(err)
+		}
+		ac, err := def.build()
+		if err != nil {
+			return daemon.AutoChannel{}, wrap(err)
+		}
+		return ac, nil
+	default:
+		return daemon.AutoChannel{}, fmt.Errorf("channel %q: unknown kind %q (want forward/http/socks5/tun)", spec, kind)
+	}
+}
+
+// splitArgs splits a command-line-like string into tokens, honouring single and
+// double quotes so values such as --label "two words" survive.
+func splitArgs(s string) ([]string, error) {
+	var (
+		toks  []string
+		cur   strings.Builder
+		inTok bool
+		quote rune
+	)
+	for _, r := range s {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			} else {
+				cur.WriteRune(r)
+			}
+			inTok = true
+		case r == '\'' || r == '"':
+			quote = r
+			inTok = true
+		case r == ' ' || r == '\t':
+			if inTok {
+				toks = append(toks, cur.String())
+				cur.Reset()
+				inTok = false
+			}
+		default:
+			cur.WriteRune(r)
+			inTok = true
+		}
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated quote in %q", s)
+	}
+	if inTok {
+		toks = append(toks, cur.String())
+	}
+	return toks, nil
 }
 
 func newChannelCloseCmd() *cobra.Command {

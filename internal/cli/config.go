@@ -30,6 +30,7 @@ type profileValues struct {
 	DecoyBackend *string
 	Path         *string
 	CACert       *string
+	Channels     []string // repeatable: one entry per `channel =` line
 }
 
 // loadProfile resolves a profile source — either an explicit path passed
@@ -216,8 +217,10 @@ func applyKey(out *profileValues, key, val string) error {
 		out.Path = strPtr(val)
 	case "cacert":
 		out.CACert = strPtr(expandPath(val))
+	case "channel":
+		out.Channels = append(out.Channels, val)
 	default:
-		return fmt.Errorf("unknown key %q (known keys: addr, unix-socket, hostname, psk, psk-file, no-tls-binding, cert, key, socket, decoy-backend, path, cacert)", key)
+		return fmt.Errorf("unknown key %q (known keys: addr, unix-socket, hostname, psk, psk-file, no-tls-binding, cert, key, socket, decoy-backend, path, cacert, channel)", key)
 	}
 	return nil
 }
@@ -334,6 +337,16 @@ func applyProfile(fs *pflag.FlagSet, source string, logger *log.Logger) (string,
 	}
 	if v.CACert != nil {
 		set("cacert", *v.CACert)
+	}
+	// "channel" is a list (StringArray): the per-call Changed guard in set()
+	// would skip all but the first, so handle it once for the whole list. CLI
+	// --channel (Changed) still overrides the config list.
+	if len(v.Channels) > 0 && !fs.Changed("channel") {
+		if f := fs.Lookup("channel"); f != nil {
+			for _, ch := range v.Channels {
+				_ = f.Value.Set(ch)
+			}
+		}
 	}
 	return path, nil
 }

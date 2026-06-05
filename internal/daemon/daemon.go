@@ -88,8 +88,27 @@ type Config struct {
 	// daemon. Optional.
 	PIDFile string
 
+	// AutoChannels are channels opened automatically, in order, once a peer is
+	// established (connect side). Best-effort: a failure is logged and the rest
+	// continue. Parsed from the connect `--channel` flag / `channel =` config.
+	AutoChannels []AutoChannel
+
 	// Logger; default if nil.
 	Logger *log.Logger
+}
+
+// AutoChannel describes a channel to open automatically once a peer is up. Kind
+// is "forward", "http", "socks5" or "tun"; only the fields relevant to that
+// kind are set. Side is "local" or "remote".
+type AutoChannel struct {
+	Kind       string
+	Side       string
+	ListenAddr string // forward / http / socks5
+	TargetAddr string // forward
+	Name       string // tun
+	CIDR       string // tun
+	MTU        int    // tun
+	Label      string
 }
 
 type Mode int
@@ -231,6 +250,9 @@ func (d *Daemon) adoptPeer(ctx context.Context, conn net.Conn, role peer.Role) e
 	d.peers[id] = p
 	d.mu.Unlock()
 	d.logger.Printf("peer %s up (remote=%s local=%s role=%v)", id, p.RemoteAddr(), p.LocalAddr(), role)
+	if len(d.cfg.AutoChannels) > 0 {
+		go d.openAutoChannels(ctx, p)
+	}
 	go func() {
 		<-p.Done()
 		d.mu.Lock()
@@ -239,6 +261,47 @@ func (d *Daemon) adoptPeer(ctx context.Context, conn net.Conn, role peer.Role) e
 		d.logger.Printf("peer %s down", id)
 	}()
 	return nil
+}
+
+// openAutoChannels opens each configured AutoChannel on p, in order, best-effort.
+func (d *Daemon) openAutoChannels(ctx context.Context, p *peer.Peer) {
+	for _, ch := range d.cfg.AutoChannels {
+		id, err := d.openAutoChannel(ctx, p, ch)
+		if err != nil {
+			d.logger.Printf("auto-channel %s failed: %v", ch.Kind, err)
+			continue
+		}
+		d.logger.Printf("auto-channel %s opened (id=%d)", ch.Kind, id)
+	}
+}
+
+func (d *Daemon) openAutoChannel(ctx context.Context, p *peer.Peer, ch AutoChannel) (uint64, error) {
+	side, err := sideFromString(ch.Side)
+	if err != nil {
+		return 0, err
+	}
+	octx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	switch ch.Kind {
+	case "forward":
+		return p.OpenChannel(octx, peer.KindForward, peer.ForwardSpec{
+			ListenSide: side, ListenAddr: ch.ListenAddr, TargetAddr: ch.TargetAddr, Label: ch.Label,
+		})
+	case "http":
+		return p.OpenChannel(octx, peer.KindHTTPProxy, peer.ProxySpec{
+			ListenSide: side, ListenAddr: ch.ListenAddr, Label: ch.Label,
+		})
+	case "socks5":
+		return p.OpenChannel(octx, peer.KindSocks5, peer.ProxySpec{
+			ListenSide: side, ListenAddr: ch.ListenAddr, Label: ch.Label,
+		})
+	case "tun":
+		return p.OpenChannel(octx, peer.KindTUN, peer.TUNSpec{
+			TUNSide: side, Name: ch.Name, CIDR: ch.CIDR, MTU: ch.MTU, Label: ch.Label,
+		})
+	default:
+		return 0, fmt.Errorf("unknown channel kind %q", ch.Kind)
+	}
 }
 
 // Close stops accepting new connections, tears down peers, removes the

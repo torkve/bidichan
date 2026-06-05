@@ -200,6 +200,30 @@ ask the peer to set up. `--listen-side local` means the listener binds on
 the side where you typed the command; `--listen-side remote` means it binds
 on the other side. The same convention applies to `--tun-side` for TUN.
 
+### Opening channels automatically on connect
+
+To bring channels up the moment the peer connects, pass `--channel` to
+`bidichan connect` (repeatable) — each value is the same argument string you'd
+give `channel open`:
+
+```sh
+bidichan connect myprofile \
+  --channel "forward -L 8080:internal-api:8443" \
+  --channel "socks5 --listen 127.0.0.1:1080" \
+  --channel "tun --cidr 10.0.0.2/24"
+```
+
+Or declare them in the profile, one `channel =` line each (CLI `--channel`
+overrides the config list):
+
+```ini
+channel = forward -L 8080:internal-api:8443
+channel = socks5 --listen 127.0.0.1:1080
+```
+
+Malformed specs fail the command immediately. Channels are opened best-effort
+once the peer is up: a failure is logged and the rest still open.
+
 ### Port forwarding
 
 SSH-style shortcuts work and are the simplest path:
