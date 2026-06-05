@@ -3,6 +3,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -17,6 +18,17 @@ import (
 	"github.com/torkve/bidichan/internal/peer"
 	"github.com/torkve/bidichan/internal/transport"
 )
+
+// rootsFor returns a cert pool trusting the listener's (self-signed) leaf, so
+// clients can verify the server cert instead of skipping verification.
+func rootsFor(t testing.TB, lis *transport.Listener) *x509.CertPool {
+	t.Helper()
+	pool := x509.NewCertPool()
+	if c := lis.Certificate(); c != nil {
+		pool.AddCert(c)
+	}
+	return pool
+}
 
 func mustPSK(t *testing.T) []byte {
 	b, err := hex.DecodeString("0011223344556677889900aabbccddeeff00112233445566778899aabbccddee")
@@ -65,9 +77,9 @@ func pair(t *testing.T, hostname string) (*peer.Peer, *peer.Peer, func()) {
 	}()
 
 	cliConn, err := transport.Dial(ctx, lis.Addr().String(), transport.ClientConfig{
-		Hostname:           hostname,
-		PSK:                psk,
-		InsecureSkipVerify: true,
+		Hostname: hostname,
+		PSK:      psk,
+		RootCAs:  rootsFor(t, lis),
 	})
 	if err != nil {
 		cancel()
@@ -301,10 +313,12 @@ func TestNginxDecoyOnWrongSNI(t *testing.T) {
 	}()
 
 	// Connect with wrong SNI and a normal-looking GET. We should get nginx.
+	// (The cert is for example.test, so a wrong-SNI dial also fails cert
+	// verification — either way the dial must not succeed.)
 	_, err = transport.Dial(ctx, lis.Addr().String(), transport.ClientConfig{
-		Hostname:           "wrong.test",
-		PSK:                psk,
-		InsecureSkipVerify: true,
+		Hostname: "wrong.test",
+		PSK:      psk,
+		RootCAs:  rootsFor(t, lis),
 	})
 	if err == nil {
 		t.Fatal("expected dial to fail (server should decoy)")

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -57,12 +58,27 @@ type Config struct {
 	// local unix socket.
 	TransportNetwork string
 
-	// SkipBinding tells the client side to omit the TLS-unique channel
+	// DecoyBackend, when set on the listen side, proxies connections that fail
+	// SNI/Host/auth to a real web backend ("host:port" or "unix:/path")
+	// instead of serving the built-in static page.
+	DecoyBackend string
+
+	// Path overrides the WebSocket upgrade request path. Empty derives a
+	// PSK-specific path. Both ends must agree (same PSK derives the same
+	// default).
+	Path string
+
+	// SkipBinding tells the client side to omit the certificate channel
 	// binding from the auth HMAC. Required when connecting to a server
 	// that is behind a TLS-terminating reverse proxy (since we have no
 	// shared TLS session with that server). Implied when
 	// TransportNetwork=="unix" on the connect side.
 	SkipBinding bool
+
+	// CACert is an optional path to a PEM bundle the connect side verifies the
+	// server certificate against, instead of the system trust store. Set it to
+	// pin a self-signed certificate or a private CA. Empty uses system roots.
+	CACert string
 
 	// ControlSocket is the Unix socket path where the local CLI talks to us.
 	// Defaults to $XDG_RUNTIME_DIR/bidichan-<pid>.sock or /tmp fallback.
@@ -131,12 +147,14 @@ func (d *Daemon) runListen(ctx context.Context) error {
 		_ = os.Remove(d.cfg.BindAddr) // remove stale socket
 	}
 	lis, err := transport.Listen(ctx, d.cfg.BindAddr, transport.ServerConfig{
-		Hostname: d.cfg.Hostname,
-		PSK:      d.cfg.PSK,
-		CertPath: d.cfg.CertPath,
-		KeyPath:  d.cfg.KeyPath,
-		Logger:   d.logger,
-		Network:  d.cfg.TransportNetwork,
+		Hostname:     d.cfg.Hostname,
+		PSK:          d.cfg.PSK,
+		CertPath:     d.cfg.CertPath,
+		KeyPath:      d.cfg.KeyPath,
+		Logger:       d.logger,
+		Network:      d.cfg.TransportNetwork,
+		DecoyBackend: d.cfg.DecoyBackend,
+		Path:         d.cfg.Path,
 	})
 	if err != nil {
 		return err
@@ -168,12 +186,24 @@ func (d *Daemon) runListen(ctx context.Context) error {
 }
 
 func (d *Daemon) runConnect(ctx context.Context) error {
+	var rootCAs *x509.CertPool
+	if d.cfg.CACert != "" {
+		pem, err := os.ReadFile(d.cfg.CACert)
+		if err != nil {
+			return fmt.Errorf("read --cacert: %w", err)
+		}
+		rootCAs = x509.NewCertPool()
+		if !rootCAs.AppendCertsFromPEM(pem) {
+			return fmt.Errorf("--cacert %s: no certificates found", d.cfg.CACert)
+		}
+	}
 	c, err := transport.Dial(ctx, d.cfg.RemoteAddr, transport.ClientConfig{
-		Hostname:           d.cfg.Hostname,
-		PSK:                d.cfg.PSK,
-		InsecureSkipVerify: true,
-		Network:            d.cfg.TransportNetwork,
-		SkipBinding:        d.cfg.SkipBinding,
+		Hostname:    d.cfg.Hostname,
+		PSK:         d.cfg.PSK,
+		RootCAs:     rootCAs,
+		Network:     d.cfg.TransportNetwork,
+		SkipBinding: d.cfg.SkipBinding,
+		Path:        d.cfg.Path,
 	})
 	if err != nil {
 		return err

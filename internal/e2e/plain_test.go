@@ -208,10 +208,10 @@ func TestPlainModeBindingMismatchRejected(t *testing.T) {
 	// Client dials with SkipBinding=true while server expects a real
 	// binding — MAC must mismatch and the server should reject.
 	_, err = transport.Dial(ctx, tcpLis.Addr().String(), transport.ClientConfig{
-		Hostname:           "example.test",
-		PSK:                psk,
-		InsecureSkipVerify: true,
-		SkipBinding:        true,
+		Hostname:    "example.test",
+		PSK:         psk,
+		RootCAs:     rootsFor(t, tcpLis),
+		SkipBinding: true,
 	})
 	if err == nil {
 		t.Fatal("expected MAC mismatch / decoy rejection, got success")

@@ -85,9 +85,9 @@ func benchPair(b *testing.B, hostname string) (*peer.Peer, *peer.Peer, func()) {
 	}()
 
 	cliConn, err := transport.Dial(ctx, lis.Addr().String(), transport.ClientConfig{
-		Hostname:           hostname,
-		PSK:                psk,
-		InsecureSkipVerify: true,
+		Hostname: hostname,
+		PSK:      psk,
+		RootCAs:  rootsFor(b, lis),
 	})
 	if err != nil {
 		cancel()

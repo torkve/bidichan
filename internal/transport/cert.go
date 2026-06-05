@@ -17,9 +17,8 @@ import (
 // LoadOrGenerateCert returns a usable certificate for the given hostname.
 // If certPath/keyPath are non-empty and exist, they are loaded; otherwise a
 // self-signed ECDSA cert is generated in memory. A self-signed cert will not
-// fool a browser, but the *wire shape* — TLS 1.2 ServerHello, Certificate,
-// ServerKeyExchange — is still indistinguishable from any other HTTPS server
-// with a self-signed cert (and there are many of those on the open Internet).
+// validate in a browser, but it still presents a normal TLS handshake, like
+// any other HTTPS server that uses a self-signed certificate.
 func LoadOrGenerateCert(certPath, keyPath, hostname string) (tls.Certificate, error) {
 	if certPath != "" && keyPath != "" {
 		if _, err := os.Stat(certPath); err == nil {

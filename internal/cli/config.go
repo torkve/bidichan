@@ -27,6 +27,9 @@ type profileValues struct {
 	Cert         *string
 	Key          *string
 	Socket       *string
+	DecoyBackend *string
+	Path         *string
+	CACert       *string
 }
 
 // loadProfile resolves a profile source — either an explicit path passed
@@ -207,8 +210,14 @@ func applyKey(out *profileValues, key, val string) error {
 		out.Key = strPtr(expandPath(val))
 	case "socket":
 		out.Socket = strPtr(expandPath(val))
+	case "decoy-backend":
+		out.DecoyBackend = strPtr(val)
+	case "path":
+		out.Path = strPtr(val)
+	case "cacert":
+		out.CACert = strPtr(expandPath(val))
 	default:
-		return fmt.Errorf("unknown key %q (known keys: addr, unix-socket, hostname, psk, psk-file, no-tls-binding, cert, key, socket)", key)
+		return fmt.Errorf("unknown key %q (known keys: addr, unix-socket, hostname, psk, psk-file, no-tls-binding, cert, key, socket, decoy-backend, path, cacert)", key)
 	}
 	return nil
 }
@@ -316,6 +325,15 @@ func applyProfile(fs *pflag.FlagSet, source string, logger *log.Logger) (string,
 	}
 	if v.Socket != nil {
 		set("socket", *v.Socket)
+	}
+	if v.DecoyBackend != nil {
+		set("decoy-backend", *v.DecoyBackend)
+	}
+	if v.Path != nil {
+		set("path", *v.Path)
+	}
+	if v.CACert != nil {
+		set("cacert", *v.CACert)
 	}
 	return path, nil
 }

@@ -1,8 +1,9 @@
 # bidichan
 
-A bidirectional transport that looks like HTTPS over TLS 1.2 on the wire.
-Once two peers complete the handshake they are equal — either side can open
-or close channels through the other end.
+A bidirectional transport that looks like a normal HTTPS WebSocket service on
+the wire (TLS 1.3, a genuine RFC 6455 upgrade). Once two peers complete the
+handshake they are equal — either side can open or close channels through the
+other end.
 
 Channel kinds:
 
@@ -13,10 +14,17 @@ Channel kinds:
 | socks5   | SOCKS5 proxy (CONNECT, no-auth) terminating on the peer       |
 | tun      | L3 TUN device with packets framed across one yamux stream     |
 
-Anyone who hits the listener with the wrong SNI, the wrong PSK, or just an
-ordinary HTTPS request gets the canonical nginx welcome page byte-for-byte
-and then a clean close. There is no visible "bidichan" port from the
-outside — only an HTTPS server.
+Any connection with the wrong SNI, the wrong PSK, or an ordinary HTTPS request
+is transparently proxied to a real web backend you configure (`--decoy-backend`),
+so it gets a genuine site — real 404s for unknown paths and all. Without a
+backend configured it falls back to a static nginx welcome page. From the
+outside there is only an HTTPS server.
+
+> **Recommended deployment:** run bidichan in plain mode behind a real
+> nginx/caddy that terminates TLS — see
+> [Recommended: behind a real nginx](#recommended-behind-a-real-nginx). Then the
+> TLS handshake, certificate, ALPN, and the response to unauthenticated requests
+> are all served by the front server.
 
 ## Build
 
@@ -53,8 +61,19 @@ bidichan listen \
   --psk <hex>
 ```
 
-By default a self-signed ECDSA cert is generated in memory. To present a
-real cert (e.g. one from Let's Encrypt), pass `--cert` and `--key`.
+By default a self-signed ECDSA cert is generated in memory. The client
+**verifies the server certificate**, so for a standalone server either present a
+publicly-trusted cert with `--cert` / `--key` (and let the client use the system
+trust store), or use a stable self-signed cert and point the client at it with
+`--cacert` (see [Client side](#client-side)). The ephemeral in-memory default
+changes on every restart and cannot be pinned — pass `--cert` / `--key` for a
+stable one. Best of all, use the
+[behind-a-real-nginx](#recommended-behind-a-real-nginx) deployment, where the
+front server already has a real, publicly-trusted cert.
+
+The WebSocket upgrade path is derived from the PSK and logged at startup
+(`websocket upgrade path is /…`). Pass `--path` on both ends to pin a specific
+path instead (useful for matching a reverse-proxy `location`).
 
 ### Client side
 
@@ -64,6 +83,10 @@ bidichan connect \
   --hostname cdn.example.com \
   --psk <hex>
 ```
+
+If the server uses a publicly-trusted cert, that's all. For a self-signed or
+private-CA server, add `--cacert /path/to/cert-or-ca.pem` so the client can
+verify it. (Behind nginx with a real cert, no `--cacert` is needed.)
 
 The two processes form a single long-lived peer link. Both keep running
 in the foreground; Ctrl-C / SIGTERM tears them down cleanly.
@@ -453,43 +476,69 @@ Trade-offs to know about:
 - **TUN through two hops** works but reduce the MTU (`--mtu 1300`)
   because each TLS layer eats ~30 bytes per packet.
 
-## DPI behaviour
+## Protocol notes
 
-- The client uses [uTLS](https://github.com/refraction-networking/utls)
-  with the `HelloChrome_Auto` preset, so the ClientHello (cipher suites,
-  extension list and ordering, GREASE values, supported groups) matches
-  the latest Chrome. JA3/JA4 fingerprinting cannot distinguish it from
-  real browser traffic.
-- The session negotiates TLS 1.2 (server-side pinned). Chrome offers
-  1.3 + 1.2 in its ClientHello, so the wire shape is exactly what a
-  Chrome ↔ old-nginx session looks like.
-- The server restricts its cipher list to the ECDHE-ECDSA / ECDHE-RSA
-  AEAD suites real nginx negotiates with modern clients, biasing the
-  JA3S cipher slot toward a plausible value.
-- The application-layer handshake is an HTTP/1.1 `Upgrade: bidichan/1`
-  request. Auth is a Bearer header carrying
-  `HMAC-SHA256(PSK, "client" || nonce || timestamp || tls_unique)` where
-  `tls_unique` is the channel binding from RFC 5929. The server's
-  `101 Switching Protocols` includes the matching server-role MAC for
-  mutual authentication.
-- Replay window: ±90 s. Nonces are remembered for the window.
-- Wrong SNI, wrong Host, missing Upgrade, missing or bad MAC, replayed
-  nonce, or just an ordinary HTTPS request — all produce a byte-for-byte
-  copy of the Ubuntu nginx default page and a clean close.
+> The recommended deployment is [behind a real nginx](#recommended-behind-a-real-nginx);
+> in that mode the TLS layer and the response to unauthenticated requests are
+> served by the real reverse proxy.
 
-### Behind a real nginx (recommended for full ServerHello parity)
+- **Client TLS:** the client uses
+  [uTLS](https://github.com/refraction-networking/utls) with the current Chrome
+  ClientHello (`HelloChrome_Auto`) for broad TLS interoperability, with the GREASE
+  `encrypted_client_hello` (ECH) extension removed (`chromeNoECHSpec`) since some
+  networks and middleboxes mishandle ECH and bidichan sends a cleartext SNI anyway.
+- **TLS version:** the server offers TLS 1.2 and 1.3, so a modern client
+  negotiates 1.3.
+- **Application handshake:** a standard RFC 6455 WebSocket upgrade
+  (`Upgrade: websocket`, `Sec-WebSocket-Key`/`-Accept`). The request path and the
+  cookie names are derived from the PSK, so they are deployment-specific rather
+  than fixed constants. Auth travels in a session cookie carrying
+  `HMAC-SHA256(PSK, "client" || nonce || timestamp || binding)`; the server's
+  `101 Switching Protocols` returns the matching server-role MAC in a `Set-Cookie`
+  for mutual authentication.
+- **Data phase:** after the `101`, the tunnel is carried inside RFC 6455 binary
+  frames (client→server masked, server→client not) — yamux runs inside the frames,
+  so the connection is standards-compliant WebSocket end to end. (nginx tunnels
+  these bytes verbatim, so the framing is end-to-end between the two peers.)
+- **ALPN / HTTP version:** the client offers `h2` + `application_settings`, but the
+  WebSocket tunnel is HTTP/1.1 (nginx does not support RFC 8441 WebSocket-over-h2),
+  so the bidichan endpoint must negotiate **http/1.1** — see the deployment note
+  below. This is how any HTTP/1.1 WebSocket endpoint behaves.
+- **Channel binding:** `binding` is the SHA-256 of the server certificate's
+  SubjectPublicKeyInfo (an SPKI pin, à la RFC 5929 `tls-server-end-point`). A
+  relay that terminates TLS with a *different* certificate derives a different
+  binding and fails auth. (This replaced `tls-unique`, which only exists in TLS 1.2.)
+- **Replay window:** ±90 s. Nonces are remembered for the window.
+- **Unauthenticated requests:** wrong SNI/Host, a non-WebSocket request, a
+  missing/bad MAC, a replayed nonce, or an ordinary HTTPS request are all
+  transparently proxied to the real `--decoy-backend`, which returns its genuine
+  responses (e.g. a real 404 for an unknown path). Without a backend configured,
+  the built-in fallback is a static nginx page.
+- **Timing:** both the TCP keepalive and the yamux keepalive are jittered per
+  connection (≈20–40 s); the WebSocket layer also emits low-rate ping frames at
+  randomised intervals as lightweight keepalive traffic.
 
-The ServerHello we generate is from Go's standard library. The cipher
-choice is tuned to be nginx-like (see above), but the *extension list
-and order* still come from Go and a JA3S inspector could in principle
-tell that apart from real nginx. For full parity, deploy bidichan behind
-a real nginx that terminates TLS and forwards the inner protocol over a
-unix socket:
+### Recommended: behind a real nginx
+
+Run bidichan in plain mode behind a real nginx/caddy that terminates TLS and
+forwards the WebSocket upgrade over a unix socket. The TLS handshake, certificate
+(real, e.g. Let's Encrypt), and the response to every non-secret path are then
+served by the front server.
+
+The bidichan endpoint must be served over **HTTP/1.1** (do not enable `http2` on
+that server block): the client offers `h2`, but WebSocket-over-HTTP/2
+(RFC 8441) is not supported by nginx, so the tunnel is HTTP/1.1 — as any
+HTTP/1.1 WebSocket endpoint is. Put it on its own
+`server_name` (e.g. a `ws.`-style host) so the rest of your site can still use
+h2/h3.
 
 ```sh
+# Pin a path that blends in with ordinary WebSocket apps, matching the nginx
+# location below. (Omit --path to use the PSK-derived one, logged at startup.)
 bidichan listen \
   --unix-socket /run/bidichan.sock \
-  --hostname cdn.example.com \
+  --hostname ws.example.com \
+  --path /ws \
   --psk <hex>
 ```
 
@@ -497,13 +546,13 @@ bidichan listen \
 # /etc/nginx/sites-enabled/bidichan
 upstream bidichan { server unix:/run/bidichan.sock; }
 server {
-    listen 443 ssl http2;
-    server_name cdn.example.com;
-    ssl_certificate     /etc/letsencrypt/live/cdn.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/cdn.example.com/privkey.pem;
+    listen 443 ssl;             # NOTE: no "http2 on" — the WS tunnel is HTTP/1.1
+    server_name ws.example.com;
+    ssl_certificate     /etc/letsencrypt/live/ws.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ws.example.com/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
 
-    location = /events {
+    location = /ws {
         proxy_pass http://bidichan;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -513,47 +562,47 @@ server {
         proxy_send_timeout 1d;
     }
     location / {
-        # Anything other than /events gets the real nginx default page,
-        # not bidichan's lookalike.
-        return 200 'real nginx server';
+        # Everything else must be a real site, so a probe to any other path
+        # behaves exactly like the host it claims to be. Serve real content or
+        # proxy to a genuine upstream — do NOT return a canned string.
+        proxy_pass http://127.0.0.1:8080;   # your real web app
     }
 }
 ```
 
-On the client side, tell bidichan not to expect a shared TLS-unique
-binding (since nginx has terminated TLS between the client and the
-server's plain socket, the two halves see different TLS sessions and no
-shared binding exists):
+On the client side, pass `--no-tls-binding` (nginx terminates TLS, so the client
+and the bidichan server see different TLS sessions and share no certificate
+binding), and `--path` to match:
 
 ```sh
 bidichan connect \
-  --addr cdn.example.com:443 \
-  --hostname cdn.example.com \
+  --addr ws.example.com:443 \
+  --hostname ws.example.com \
+  --path /ws \
   --psk <hex> \
   --no-tls-binding
 ```
 
-In this deployment the *real* nginx ServerHello goes on the wire, so the
-JA3S fingerprint is literally that of the production nginx version
-serving the rest of the site.
-
 ### Caveats
 
-- The default cert is self-signed. The wire shape is unchanged (plenty
-  of real servers serve self-signed certs), but a real cert is trivial
-  to bolt on with `--cert` / `--key` — or just use the nginx-front
-  deployment, which already has a real cert.
+- The client always verifies the server certificate (system trust store, or
+  `--cacert` for a self-signed / private CA). The in-memory default cert is
+  ephemeral and cannot be pinned, so a standalone server should use `--cert` /
+  `--key` (and the client `--cacert`), a publicly-trusted cert, or the nginx
+  front.
 - The TUN channel needs root or `CAP_NET_ADMIN`.
-- `--no-tls-binding` drops the channel binding from the auth HMAC. The
-  PSK + nonce + timestamp window (±90s) still protect against replay,
-  but an attacker who controls the TLS terminator could in principle
-  replay an upgrade into a different TLS session.
+- `--no-tls-binding` drops the certificate channel binding from the auth HMAC;
+  use it only behind a TLS-terminating reverse proxy. The client still verifies
+  the proxy's certificate, so a relay must present a trusted cert. In standalone
+  mode (binding present) a relay that swaps the certificate is additionally
+  caught at the MAC check, because the binding is the SHA-256 of the server
+  cert's public key and the two ends would derive different values.
 
 ## Layout
 
 ```
 internal/
-  transport/   TLS 1.2 listener/dialer, nginx decoy, PSK+TLS-exporter auth
+  transport/   TLS 1.3 listener/dialer, WebSocket auth+framing, cert binding, decoy
   peer/        yamux session, JSON control protocol, channel registry
   channel/     forward, HTTP/SOCKS5 proxy, and TUN implementations
   daemon/      long-running process: peers + the local CLI control socket

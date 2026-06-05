@@ -53,13 +53,13 @@ func Execute(args []string) int {
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "bidichan",
-		Short: "DPI-resistant bidirectional transport (TLS 1.2 + SNI)",
-		Long: `bidichan establishes a long-lived peer link wrapped in TLS 1.2 with SNI,
+		Short: "Reliable bidirectional transport over TLS + WebSocket",
+		Long: `bidichan establishes a long-lived peer link over a TLS WebSocket,
 authenticated by a pre-shared key.  After authentication both peers are
 equal: either side can open or close channels (port-forwarding, HTTP/
 SOCKS5 proxies, TUN devices) on the other end.
 
-Wrong SNI / wrong PSK / wrong path → nginx default HTML and disconnect.
+Wrong SNI / wrong PSK / wrong path → a standard web response and disconnect.
 
 Both --psk and --hostname are required on listen and connect; supply them
 inline, via --psk-file PATH, or via a peer config profile (see the
@@ -81,25 +81,27 @@ inline, via --psk-file PATH, or via a peer config profile (see the
 
 func newListenCmd() *cobra.Command {
 	var (
-		configSrc string
-		addr      string
-		unixPath  string
-		hostname  string
-		pskHex    string
-		pskFile   string
-		certPath  string
-		keyPath   string
-		sock      string
+		configSrc    string
+		addr         string
+		unixPath     string
+		hostname     string
+		pskHex       string
+		pskFile      string
+		certPath     string
+		keyPath      string
+		sock         string
+		decoyBackend string
+		wsPath       string
 	)
 	cmd := &cobra.Command{
 		Use:   "listen [<profile>]",
 		Short: "Run as the server end",
 		Long: `Run as the server end.
 
-Accepts authenticated peers; serves an nginx decoy to everyone else
-(in TLS mode). With --unix-socket the daemon binds a unix socket and
-skips TLS, expecting a reverse proxy (e.g. nginx) to terminate TLS
-in front. An optional positional profile name (or --config name|path)
+Accepts authenticated peers; serves a standard nginx response to
+unauthenticated clients (in TLS mode). With --unix-socket the daemon
+binds a unix socket and skips TLS, expecting a reverse proxy (e.g.
+nginx) to terminate TLS in front. An optional positional profile name (or --config name|path)
 loads connection settings from $XDG_CONFIG_HOME/bidichan/<name>.conf
 or /etc/bidichan/<name>.conf.`,
 		Args: cobra.MaximumNArgs(1),
@@ -156,6 +158,8 @@ or /etc/bidichan/<name>.conf.`,
 				CertPath:         certPath,
 				KeyPath:          keyPath,
 				TransportNetwork: network,
+				DecoyBackend:     decoyBackend,
+				Path:             wsPath,
 				ControlSocket:    sock,
 				Logger:           logger,
 			})
@@ -174,6 +178,8 @@ or /etc/bidichan/<name>.conf.`,
 	f.StringVar(&pskFile, "psk-file", "", "file containing the hex PSK on a single line")
 	f.StringVar(&certPath, "cert", "", "TLS certificate PEM (self-signed if absent); ignored in unix-socket mode")
 	f.StringVar(&keyPath, "key", "", "TLS key PEM; ignored in unix-socket mode")
+	f.StringVar(&decoyBackend, "decoy-backend", "", "proxy unauthenticated connections to this real web backend (host:port or unix:/path) instead of the built-in static page")
+	f.StringVar(&wsPath, "path", "", "WebSocket upgrade request path (default: derived from the PSK; logged at startup)")
 	f.StringVar(&sock, "socket", "", "local CLI control socket path (default $XDG_RUNTIME_DIR/bidichan-<pid>.sock)")
 
 	_ = cmd.RegisterFlagCompletionFunc("config", profileFlagCompletion)
@@ -192,6 +198,8 @@ func newConnectCmd() *cobra.Command {
 		pskFile   string
 		noBind    bool
 		sock      string
+		wsPath    string
+		caCert    string
 	)
 	cmd := &cobra.Command{
 		Use:   "connect [<profile>]",
@@ -257,6 +265,8 @@ $XDG_CONFIG_HOME/bidichan/<name>.conf or /etc/bidichan/<name>.conf.`,
 				PSK:              psk,
 				TransportNetwork: network,
 				SkipBinding:      noBind,
+				Path:             wsPath,
+				CACert:           caCert,
 				ControlSocket:    sock,
 				Logger:           logger,
 			})
@@ -273,7 +283,9 @@ $XDG_CONFIG_HOME/bidichan/<name>.conf or /etc/bidichan/<name>.conf.`,
 	f.StringVar(&hostname, "hostname", "", "SNI hostname to send and require")
 	f.StringVar(&pskHex, "psk", "", "pre-shared key (hex)")
 	f.StringVar(&pskFile, "psk-file", "", "file containing the hex PSK on a single line")
-	f.BoolVar(&noBind, "no-tls-binding", false, "omit the TLS-unique channel binding from auth — required when the server is behind a TLS-terminating reverse proxy")
+	f.BoolVar(&noBind, "no-tls-binding", false, "omit the certificate channel binding from auth — required when the server is behind a TLS-terminating reverse proxy")
+	f.StringVar(&wsPath, "path", "", "WebSocket upgrade request path (default: derived from the PSK; must match the server)")
+	f.StringVar(&caCert, "cacert", "", "PEM bundle to verify the server cert against (for self-signed / private CA); default: system trust store")
 	f.StringVar(&sock, "socket", "", "local CLI control socket path")
 
 	_ = cmd.RegisterFlagCompletionFunc("config", profileFlagCompletion)
@@ -575,7 +587,7 @@ func newChannelOpenTUNCmd() *cobra.Command {
 	f.StringVar(&side, "tun-side", "local", "local|remote — which side names the device")
 	f.StringVar(&name, "name", "", "device name (Linux only)")
 	f.StringVar(&cidr, "cidr", "", "IP/CIDR to assign (Linux only)")
-	f.IntVar(&mtu, "mtu", 1400, "MTU")
+	f.IntVar(&mtu, "mtu", 1500, "MTU")
 	f.StringVar(&label, "label", "", "human label")
 	_ = cmd.RegisterFlagCompletionFunc("tun-side", localRemoteCompletion)
 	return cmd

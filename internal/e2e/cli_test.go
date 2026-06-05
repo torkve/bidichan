@@ -24,6 +24,14 @@ func TestCLIRoundTrip(t *testing.T) {
 	srvSock := filepath.Join(tmp, "srv.sock")
 	cliSock := filepath.Join(tmp, "cli.sock")
 
+	// Give the server a stable cert and have the client pin it via CACert,
+	// since the client now verifies the server certificate.
+	certPEM, keyPEM := mustGenCertPEM(t, "example.test")
+	certPath := filepath.Join(tmp, "cert.pem")
+	keyPath := filepath.Join(tmp, "key.pem")
+	mustWrite(t, certPath, certPEM, 0o644)
+	mustWrite(t, keyPath, keyPEM, 0o644)
+
 	// Pick a free port for the transport.
 	probe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -37,6 +45,8 @@ func TestCLIRoundTrip(t *testing.T) {
 		BindAddr:      bindAddr,
 		Hostname:      "example.test",
 		PSK:           psk,
+		CertPath:      certPath,
+		KeyPath:       keyPath,
 		ControlSocket: srvSock,
 		Logger:        logger,
 	})
@@ -57,6 +67,7 @@ func TestCLIRoundTrip(t *testing.T) {
 		RemoteAddr:    bindAddr,
 		Hostname:      "example.test",
 		PSK:           psk,
+		CACert:        certPath,
 		ControlSocket: cliSock,
 		Logger:        logger,
 	})

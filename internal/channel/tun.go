@@ -147,7 +147,10 @@ func (r *tunRunner) effMTU() int {
 	if r.spec.MTU > 0 {
 		return r.spec.MTU
 	}
-	return 1400
+	// Default to the common LAN MTU. The tunnel runs over TCP, which segments
+	// the byte stream regardless, so this does not cause outer-path
+	// fragmentation.
+	return 1500
 }
 
 func setupTUN(ctx context.Context, p *peer.Peer, chID uint64, specRaw json.RawMessage, originator bool) (json.RawMessage, peer.ChannelRunner, error) {

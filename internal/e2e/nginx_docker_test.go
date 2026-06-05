@@ -33,8 +33,8 @@ import (
 //
 //   - the bidichan client (uTLS) can complete the auth+upgrade through nginx
 //   - a forward channel opens and round-trips bytes
-//   - an unauthenticated HTTPS probe (no Upgrade header) gets the real nginx
-//     default page, not our lookalike — because the front IS real nginx
+//   - an unauthenticated HTTPS request (no Upgrade header) gets the real nginx
+//     default page, served by the front nginx itself
 //
 // Requires docker, network access for the first nginx:alpine pull, and a
 // kernel that lets us bind-mount a unix socket into a container. Skips
@@ -74,6 +74,7 @@ func TestNginxDockerFront(t *testing.T) {
 		PSK:      psk,
 		Logger:   logger,
 		Network:  "unix",
+		Path:     "/events",
 	})
 	if err != nil {
 		t.Fatalf("Listen plain: %v", err)
@@ -179,11 +180,16 @@ func TestNginxDockerFront(t *testing.T) {
 	// the TLS terminator (nginx) sits between us and the bidichan-server.
 	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer dialCancel()
+	nginxRoots := x509.NewCertPool()
+	if !nginxRoots.AppendCertsFromPEM(certPEM) {
+		t.Fatal("failed to build cert pool from nginx cert")
+	}
 	cliConn, err := transport.Dial(dialCtx, fmt.Sprintf("127.0.0.1:%d", hostPort), transport.ClientConfig{
-		Hostname:           "example.test",
-		PSK:                psk,
-		InsecureSkipVerify: true,
-		SkipBinding:        true,
+		Hostname:    "example.test",
+		PSK:         psk,
+		RootCAs:     nginxRoots,
+		SkipBinding: true,
+		Path:        "/events",
 	})
 	if err != nil {
 		dumpNginxLogs(t, containerID)

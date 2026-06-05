@@ -60,7 +60,7 @@ func TestTwoHopProxyJumpRecipe(t *testing.T) {
 
 	// Step 1 of the recipe: A's first peer dials B.
 	aViaBConn, err := transport.Dial(ctx, bLis.Addr().String(), transport.ClientConfig{
-		Hostname: "jump.test", PSK: pskB, InsecureSkipVerify: true,
+		Hostname: "jump.test", PSK: pskB, RootCAs: rootsFor(t, bLis),
 	})
 	if err != nil {
 		t.Fatalf("A->B dial: %v", err)
@@ -92,7 +92,7 @@ func TestTwoHopProxyJumpRecipe(t *testing.T) {
 	// jump forward. transport.Dial has no idea it's traversing a
 	// tunnel — the inner TLS+PSK+TLS-binding all live between A and C.
 	aToCConn, err := transport.Dial(ctx, jumpListener, transport.ClientConfig{
-		Hostname: "cdn.test", PSK: pskC, InsecureSkipVerify: true,
+		Hostname: "cdn.test", PSK: pskC, RootCAs: rootsFor(t, cLis),
 	})
 	if err != nil {
 		t.Fatalf("A->C-via-B dial: %v", err)

@@ -3,14 +3,16 @@ package transport
 import (
 	"bufio"
 	"context"
+	"crypto/hmac"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,11 +21,11 @@ import (
 // ServerConfig configures the listener side of the transport.
 //
 // In the default mode (Network=="tcp") we terminate TLS ourselves: SNI must
-// match Hostname and the auth HMAC is bound to the TLS-unique channel
-// binding (RFC 5929). In plain mode (Network=="unix") we skip TLS entirely
-// — a reverse proxy such as nginx is expected to terminate TLS and forward
-// the inner HTTP upgrade to our unix socket. Plain mode is the recommended
-// deployment for full ServerHello fingerprint parity with real nginx.
+// match Hostname and the auth HMAC is bound to the server certificate's SPKI.
+// In plain mode (Network=="unix") we skip TLS entirely — a reverse proxy such
+// as nginx is expected to terminate TLS and forward the inner HTTP upgrade to
+// our unix socket. Plain mode is the recommended deployment, so the TLS layer
+// is served by the real reverse proxy.
 type ServerConfig struct {
 	Hostname string
 	PSK      []byte
@@ -34,6 +36,18 @@ type ServerConfig struct {
 	// Network is "tcp" (default) or "unix". The Address passed to Listen is
 	// interpreted accordingly.
 	Network string
+
+	// DecoyBackend, when non-empty, is a real web backend that connections
+	// failing SNI/Host/auth are transparently proxied to, so an unauthenticated
+	// client reaches a genuine site instead of a static page. Formats:
+	// "host:port" (TCP) or "unix:/path/to.sock". Empty falls back to the
+	// built-in static nginx page.
+	DecoyBackend string
+
+	// Path is the request path the WebSocket upgrade must target. Empty
+	// derives a PSK-specific path (the default); set it to pin a fixed path
+	// that matches a reverse-proxy location.
+	Path string
 }
 
 // plainMode is true when the listener does not terminate TLS itself.
@@ -44,6 +58,17 @@ type Listener struct {
 	cfg   ServerConfig
 	inner net.Listener
 	tlsC  *tls.Config // nil in plain mode
+
+	// binding is the SPKI channel binding for our certificate, mixed into the
+	// auth MAC. Empty in plain mode (no TLS terminated here).
+	binding []byte
+
+	// cert is the leaf certificate the listener presents (nil in plain mode),
+	// exposed via Certificate so a client can pin a self-signed cert.
+	cert *x509.Certificate
+
+	// path is the effective request path the WebSocket upgrade must target.
+	path string
 
 	mu     sync.Mutex
 	closed bool
@@ -74,6 +99,11 @@ func Listen(ctx context.Context, addr string, cfg ServerConfig) (*Listener, erro
 		cfg:        cfg,
 		seenNonces: newNonceCache(),
 	}
+	l.path = cfg.Path
+	if l.path == "" {
+		l.path = derivePath(cfg.PSK)
+	}
+	cfg.Logger.Printf("transport: websocket upgrade path is %s", l.path)
 
 	if !cfg.plainMode() {
 		cert, err := LoadOrGenerateCert(cfg.CertPath, cfg.KeyPath, cfg.Hostname)
@@ -83,11 +113,12 @@ func Listen(ctx context.Context, addr string, cfg ServerConfig) (*Listener, erro
 		l.tlsC = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
-			MaxVersion:   tls.VersionTLS12,
-			// Restrict to the AEAD ECDHE suites real nginx negotiates with
-			// modern clients. Go's stdlib server algorithm picks from this
-			// (narrowed) set, so the JA3S cipher slot ends up plausible
-			// instead of being whichever default Go would pick today.
+			MaxVersion:   tls.VersionTLS13,
+			// CipherSuites only governs the TLS 1.2 fallback (Go does not
+			// allow configuring 1.3 suites). A modern client offering 1.3
+			// negotiates 1.3 and these are not used. Restrict the 1.2 set to
+			// the AEAD ECDHE suites real nginx negotiates with modern clients
+			// so the JA3S cipher slot stays plausible on the fallback path.
 			CipherSuites: []uint16{
 				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
@@ -98,11 +129,22 @@ func Listen(ctx context.Context, addr string, cfg ServerConfig) (*Listener, erro
 			},
 			NextProtos: []string{"http/1.1"},
 		}
+
+		leaf := cert.Leaf
+		if leaf == nil {
+			leaf, err = x509.ParseCertificate(cert.Certificate[0])
+			if err != nil {
+				return nil, fmt.Errorf("parse leaf cert: %w", err)
+			}
+		}
+		l.binding = spkiBinding(leaf)
+		l.cert = leaf
 	}
 
 	var lc net.ListenConfig
 	if cfg.Network == "tcp" {
-		lc.KeepAlive = 30 * time.Second
+		// Use a jittered keepalive interval per connection.
+		lc.KeepAlive = randDuration(20*time.Second, 40*time.Second)
 	}
 	inner, err := lc.Listen(ctx, cfg.Network, addr)
 	if err != nil {
@@ -125,6 +167,10 @@ func Listen(ctx context.Context, addr string, cfg ServerConfig) (*Listener, erro
 
 // Addr returns the bound network address.
 func (l *Listener) Addr() net.Addr { return l.inner.Addr() }
+
+// Certificate returns the leaf certificate the listener presents, or nil in
+// plain mode. A client can add this to a cert pool to pin a self-signed cert.
+func (l *Listener) Certificate() *x509.Certificate { return l.cert }
 
 // Close stops the listener.
 func (l *Listener) Close() error {
@@ -187,17 +233,11 @@ func (l *Listener) handle(raw net.Conn, out chan<- net.Conn) {
 		if st.ServerName != l.cfg.Hostname {
 			l.cfg.Logger.Printf("transport: rejecting %s: SNI %q != %q", raw.RemoteAddr(), st.ServerName, l.cfg.Hostname)
 			br := bufio.NewReader(tlsConn)
-			serveDecoyAndDrain(tlsConn, br, nil)
+			l.serveDecoy(tlsConn, br, nil)
 			return
 		}
 		appConn = tlsConn
-		binding = st.TLSUnique
-		if len(binding) == 0 {
-			l.cfg.Logger.Printf("transport: rejecting %s: tls binding unavailable", raw.RemoteAddr())
-			br := bufio.NewReader(tlsConn)
-			serveDecoyAndDrain(tlsConn, br, nil)
-			return
-		}
+		binding = l.binding
 	}
 
 	_ = appConn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -209,14 +249,15 @@ func (l *Listener) handle(raw net.Conn, out chan<- net.Conn) {
 		return
 	}
 
-	if !strings.EqualFold(req.Host, l.cfg.Hostname) || !requestLooksLikeUs(req) {
-		serveDecoyAndDrain(appConn, br, req)
+	if !strings.EqualFold(req.Host, l.cfg.Hostname) || req.URL.Path != l.path || !isWebSocketUpgrade(req) {
+		l.serveDecoy(appConn, br, req)
 		return
 	}
 
-	if err := l.verifyClientAuth(req, binding); err != nil {
+	nonce, ts, err := l.verifyClientAuth(req, binding)
+	if err != nil {
 		l.cfg.Logger.Printf("transport: rejecting %s: auth %v", raw.RemoteAddr(), err)
-		serveDecoyAndDrain(appConn, br, req)
+		l.serveDecoy(appConn, br, req)
 		return
 	}
 
@@ -225,7 +266,7 @@ func (l *Listener) handle(raw net.Conn, out chan<- net.Conn) {
 		_ = req.Body.Close()
 	}
 
-	if err := l.replySwitchingProtocols(appConn, req, binding); err != nil {
+	if err := l.replySwitchingProtocols(appConn, req, binding, nonce, ts); err != nil {
 		l.cfg.Logger.Printf("transport: write 101 failed: %v", err)
 		_ = appConn.Close()
 		return
@@ -233,7 +274,9 @@ func (l *Listener) handle(raw net.Conn, out chan<- net.Conn) {
 
 	_ = appConn.SetDeadline(time.Time{})
 
-	conn := newBufferedConn(appConn, br)
+	// Wrap the data phase in real RFC 6455 framing (server does not mask) so
+	// the post-101 bytes are valid WebSocket frames, not raw yamux.
+	conn := newWSConn(newBufferedConn(appConn, br), false, true)
 	select {
 	case out <- conn:
 	default:
@@ -241,50 +284,41 @@ func (l *Listener) handle(raw net.Conn, out chan<- net.Conn) {
 	}
 }
 
-// verifyClientAuth checks the upgrade request's HMAC. binding may be nil
-// for plain mode — both sides must agree, mismatch fails the MAC check.
-func (l *Listener) verifyClientAuth(req *http.Request, binding []byte) error {
-	tsStr := req.Header.Get("X-BC-Time")
-	nonceStr := req.Header.Get("X-BC-Nonce")
-	auth := req.Header.Get("Authorization")
-	const prefix = "Bearer "
-	if !strings.HasPrefix(auth, prefix) {
-		return errors.New("missing bearer")
-	}
-	clientMAC := strings.TrimPrefix(auth, prefix)
-
-	ts, err := strconv.ParseInt(tsStr, 10, 64)
+// verifyClientAuth checks the upgrade request's auth cookie and returns the
+// nonce and timestamp it carried (needed to compute the server's reply MAC).
+// binding may be nil for plain mode — both sides must agree, mismatch fails
+// the MAC check.
+func (l *Listener) verifyClientAuth(req *http.Request, binding []byte) ([]byte, int64, error) {
+	c, err := req.Cookie(authCookieName(l.cfg.PSK))
 	if err != nil {
-		return fmt.Errorf("bad timestamp: %w", err)
+		return nil, 0, errors.New("missing auth cookie")
+	}
+	nonce, ts, mac, err := decodeAuthPayload(c.Value)
+	if err != nil {
+		return nil, 0, fmt.Errorf("bad auth payload: %w", err)
 	}
 	if d := time.Since(time.Unix(ts, 0)); d > maxClockSkew || d < -maxClockSkew {
-		return fmt.Errorf("stale timestamp (skew %v)", d)
+		return nil, 0, fmt.Errorf("stale timestamp (skew %v)", d)
 	}
-	nonce, err := parseNonce(nonceStr)
-	if err != nil {
-		return err
-	}
-	if !l.seenNonces.add(nonceStr, time.Now()) {
-		return errors.New("nonce replay")
+	nonceKey := base64.RawURLEncoding.EncodeToString(nonce)
+	if !l.seenNonces.add(nonceKey, time.Now()) {
+		return nil, 0, errors.New("nonce replay")
 	}
 	want := computeAuthMAC(l.cfg.PSK, "client", nonce, ts, binding)
-	if !constantTimeEqHex(want, clientMAC) {
-		return errors.New("mac mismatch")
+	if !hmac.Equal(want, mac) {
+		return nil, 0, errors.New("mac mismatch")
 	}
-	return nil
+	return nonce, ts, nil
 }
 
-func (l *Listener) replySwitchingProtocols(c net.Conn, req *http.Request, binding []byte) error {
-	tsStr := req.Header.Get("X-BC-Time")
-	nonceStr := req.Header.Get("X-BC-Nonce")
-	ts, _ := strconv.ParseInt(tsStr, 10, 64)
-	nonce, _ := parseNonce(nonceStr)
-
+func (l *Listener) replySwitchingProtocols(c net.Conn, req *http.Request, binding, nonce []byte, ts int64) error {
 	serverMAC := computeAuthMAC(l.cfg.PSK, "server", nonce, ts, binding)
+	verifyCookie := verifyCookieName(l.cfg.PSK) + "=" + base64.RawURLEncoding.EncodeToString(serverMAC)
 	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: " + upgradeToken + "\r\n" +
+		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
-		"X-BC-Verify: " + serverMAC + "\r\n" +
+		"Sec-WebSocket-Accept: " + wsAccept(req.Header.Get("Sec-WebSocket-Key")) + "\r\n" +
+		"Set-Cookie: " + verifyCookie + "; Path=/; HttpOnly\r\n" +
 		"\r\n"
 	_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	_, err := io.WriteString(c, resp)
