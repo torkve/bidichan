@@ -20,11 +20,12 @@ so it gets a genuine site — real 404s for unknown paths and all. Without a
 backend configured it falls back to a static nginx welcome page. From the
 outside there is only an HTTPS server.
 
-> **Recommended deployment:** run bidichan in plain mode behind a real
-> nginx/caddy that terminates TLS — see
-> [Recommended: behind a real nginx](#recommended-behind-a-real-nginx). Then the
+> **Recommended deployment:** run bidichan behind a real nginx/caddy that
+> terminates TLS — this is the setup shown in [Quick start](#quick-start). The
 > TLS handshake, certificate, ALPN, and the response to unauthenticated requests
-> are all served by the front server.
+> are then all served by the front server. bidichan can also terminate TLS
+> itself, but that is **not recommended** — see
+> [Standalone mode](#standalone-mode-not-recommended).
 
 ## Build
 
@@ -52,41 +53,74 @@ head -c 32 /dev/urandom | xxd -p -c 64
 # -> e.g. b7e3c6e1...d39c6a7a (use the same value on both sides)
 ```
 
-### Server side
+The recommended setup runs bidichan behind a real nginx (or caddy) that
+terminates TLS: nginx presents a real, CA-issued certificate and serves your
+actual website to everyone else, while bidichan listens on a unix socket and
+only ever sees the authenticated WebSocket. (To run bidichan without a front
+proxy, see [Standalone mode](#standalone-mode-not-recommended) — intended for
+testing and trusted networks.)
+
+### Server side (behind nginx)
+
+bidichan listens on a unix socket in plain mode; nginx terminates TLS in front:
 
 ```sh
+# --path pins the WebSocket path to match the nginx location below; omit it to
+# use the PSK-derived path, logged at startup.
 bidichan listen \
-  --addr 0.0.0.0:443 \
-  --hostname cdn.example.com \
+  --unix-socket /run/bidichan.sock \
+  --hostname ws.example.com \
+  --path /ws \
   --psk <hex>
 ```
 
-By default a self-signed ECDSA cert is generated in memory. The client
-**verifies the server certificate**, so for a standalone server either present a
-publicly-trusted cert with `--cert` / `--key` (and let the client use the system
-trust store), or use a stable self-signed cert and point the client at it with
-`--cacert` (see [Client side](#client-side)). The ephemeral in-memory default
-changes on every restart and cannot be pinned — pass `--cert` / `--key` for a
-stable one. Best of all, use the
-[behind-a-real-nginx](#recommended-behind-a-real-nginx) deployment, where the
-front server already has a real, publicly-trusted cert.
+The endpoint must be served over **HTTP/1.1** (do not enable `http2` on this
+server block): the client offers `h2`, but WebSocket-over-HTTP/2 (RFC 8441) is
+not supported by nginx, so the tunnel is HTTP/1.1 — as any HTTP/1.1 WebSocket
+endpoint is. Put it on its own `server_name` (e.g. a `ws.`-style host) so the
+rest of your site can still use h2/h3.
 
-The WebSocket upgrade path is derived from the PSK and logged at startup
-(`websocket upgrade path is /…`). Pass `--path` on both ends to pin a specific
-path instead (useful for matching a reverse-proxy `location`).
+```nginx
+# /etc/nginx/sites-enabled/bidichan
+upstream bidichan { server unix:/run/bidichan.sock; }
+server {
+    listen 443 ssl;             # NOTE: no "http2 on" — the WS tunnel is HTTP/1.1
+    server_name ws.example.com;
+    ssl_certificate     /etc/letsencrypt/live/ws.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ws.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    location = /ws {
+        proxy_pass http://bidichan;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 1d;
+        proxy_send_timeout 1d;
+    }
+    location / {
+        # Everything else must be a real site, so any other path behaves exactly
+        # like the host it claims to be. Serve real content or proxy to a genuine
+        # upstream — do NOT return a canned string.
+        proxy_pass http://127.0.0.1:8080;   # your real web app
+    }
+}
+```
 
 ### Client side
 
+Pass `--no-tls-binding` (nginx terminates TLS, so the client and the bidichan
+server share no certificate binding) and `--path` to match:
+
 ```sh
 bidichan connect \
-  --addr cdn.example.com:443 \
-  --hostname cdn.example.com \
-  --psk <hex>
+  --addr ws.example.com:443 \
+  --hostname ws.example.com \
+  --path /ws \
+  --psk <hex> \
+  --no-tls-binding
 ```
-
-If the server uses a publicly-trusted cert, that's all. For a self-signed or
-private-CA server, add `--cacert /path/to/cert-or-ca.pem` so the client can
-verify it. (Behind nginx with a real cert, no `--cacert` is needed.)
 
 The two processes form a single long-lived peer link. Both keep running
 in the foreground; Ctrl-C / SIGTERM tears them down cleanly.
@@ -478,9 +512,8 @@ Trade-offs to know about:
 
 ## Protocol notes
 
-> The recommended deployment is [behind a real nginx](#recommended-behind-a-real-nginx);
-> in that mode the TLS layer and the response to unauthenticated requests are
-> served by the real reverse proxy.
+> In the recommended deployment ([Quick start](#quick-start)) the TLS layer and
+> the response to unauthenticated requests are served by the real reverse proxy.
 
 - **Client TLS:** the client uses
   [uTLS](https://github.com/refraction-networking/utls) with the current Chrome
@@ -502,8 +535,9 @@ Trade-offs to know about:
   these bytes verbatim, so the framing is end-to-end between the two peers.)
 - **ALPN / HTTP version:** the client offers `h2` + `application_settings`, but the
   WebSocket tunnel is HTTP/1.1 (nginx does not support RFC 8441 WebSocket-over-h2),
-  so the bidichan endpoint must negotiate **http/1.1** — see the deployment note
-  below. This is how any HTTP/1.1 WebSocket endpoint behaves.
+  so the bidichan endpoint must negotiate **http/1.1** — the front server block
+  must not enable `http2` (see [Quick start](#quick-start)). This is how any
+  HTTP/1.1 WebSocket endpoint behaves.
 - **Channel binding:** `binding` is the SHA-256 of the server certificate's
   SubjectPublicKeyInfo (an SPKI pin, à la RFC 5929 `tls-server-end-point`). A
   relay that terminates TLS with a *different* certificate derives a different
@@ -518,78 +552,12 @@ Trade-offs to know about:
   connection (≈20–40 s); the WebSocket layer also emits low-rate ping frames at
   randomised intervals as lightweight keepalive traffic.
 
-### Recommended: behind a real nginx
-
-Run bidichan in plain mode behind a real nginx/caddy that terminates TLS and
-forwards the WebSocket upgrade over a unix socket. The TLS handshake, certificate
-(real, e.g. Let's Encrypt), and the response to every non-secret path are then
-served by the front server.
-
-The bidichan endpoint must be served over **HTTP/1.1** (do not enable `http2` on
-that server block): the client offers `h2`, but WebSocket-over-HTTP/2
-(RFC 8441) is not supported by nginx, so the tunnel is HTTP/1.1 — as any
-HTTP/1.1 WebSocket endpoint is. Put it on its own
-`server_name` (e.g. a `ws.`-style host) so the rest of your site can still use
-h2/h3.
-
-```sh
-# Pin a path that blends in with ordinary WebSocket apps, matching the nginx
-# location below. (Omit --path to use the PSK-derived one, logged at startup.)
-bidichan listen \
-  --unix-socket /run/bidichan.sock \
-  --hostname ws.example.com \
-  --path /ws \
-  --psk <hex>
-```
-
-```nginx
-# /etc/nginx/sites-enabled/bidichan
-upstream bidichan { server unix:/run/bidichan.sock; }
-server {
-    listen 443 ssl;             # NOTE: no "http2 on" — the WS tunnel is HTTP/1.1
-    server_name ws.example.com;
-    ssl_certificate     /etc/letsencrypt/live/ws.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/ws.example.com/privkey.pem;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-
-    location = /ws {
-        proxy_pass http://bidichan;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_read_timeout 1d;
-        proxy_send_timeout 1d;
-    }
-    location / {
-        # Everything else must be a real site, so a probe to any other path
-        # behaves exactly like the host it claims to be. Serve real content or
-        # proxy to a genuine upstream — do NOT return a canned string.
-        proxy_pass http://127.0.0.1:8080;   # your real web app
-    }
-}
-```
-
-On the client side, pass `--no-tls-binding` (nginx terminates TLS, so the client
-and the bidichan server see different TLS sessions and share no certificate
-binding), and `--path` to match:
-
-```sh
-bidichan connect \
-  --addr ws.example.com:443 \
-  --hostname ws.example.com \
-  --path /ws \
-  --psk <hex> \
-  --no-tls-binding
-```
-
 ### Caveats
 
-- The client always verifies the server certificate (system trust store, or
-  `--cacert` for a self-signed / private CA). The in-memory default cert is
-  ephemeral and cannot be pinned, so a standalone server should use `--cert` /
-  `--key` (and the client `--cacert`), a publicly-trusted cert, or the nginx
-  front.
+- The client always verifies the server certificate — the system trust store by
+  default, or `--cacert` for a self-signed / private CA. See
+  [Standalone mode](#standalone-mode-not-recommended) for certificate handling
+  without a front proxy.
 - The TUN channel needs root or `CAP_NET_ADMIN`.
 - `--no-tls-binding` drops the certificate channel binding from the auth HMAC;
   use it only behind a TLS-terminating reverse proxy. The client still verifies
@@ -597,6 +565,51 @@ bidichan connect \
   mode (binding present) a relay that swaps the certificate is additionally
   caught at the MAC check, because the binding is the SHA-256 of the server
   cert's public key and the two ends would derive different values.
+
+## Standalone mode (not recommended)
+
+bidichan can terminate TLS itself, with no front proxy. This is convenient for
+testing and trusted/controlled networks, but it is **not** equivalent to a
+normal production HTTPS server — see the notice below.
+
+Server:
+
+```sh
+bidichan listen \
+  --addr 0.0.0.0:443 \
+  --hostname cdn.example.com \
+  --cert cert.pem --key key.pem \
+  --psk <hex>
+```
+
+By default a self-signed ECDSA certificate is generated in memory. It is
+ephemeral (regenerated on every restart) and cannot be pinned, so supply a
+stable `--cert` / `--key` — publicly-trusted (e.g. Let's Encrypt) or self-signed.
+The WebSocket path is derived from the PSK and logged at startup; pass `--path`
+on both ends to pin a specific one.
+
+Client:
+
+```sh
+bidichan connect \
+  --addr cdn.example.com:443 \
+  --hostname cdn.example.com \
+  --cacert cert.pem \
+  --psk <hex>
+```
+
+If the server presents a publicly-trusted certificate, omit `--cacert`. For a
+self-signed or private-CA server, point `--cacert` at the certificate or CA so
+the client can verify it.
+
+> **A standalone endpoint is not a normal HTTPS server.** It terminates TLS with
+> Go's standard-library TLS stack and (by default) a self-signed certificate, and
+> it only speaks HTTP/1.1. It therefore does not present the TLS/HTTP profile of a
+> typical production website — a CA-issued certificate, an nginx/OpenSSL
+> handshake, HTTP/2. Networks, proxies, and security middleboxes may handle such
+> a connection differently from ordinary HTTPS. Use standalone mode only for
+> testing or on networks you control; for anything on the public Internet, use
+> the [behind-nginx setup](#quick-start) instead.
 
 ## Layout
 
