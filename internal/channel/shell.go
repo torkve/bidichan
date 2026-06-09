@@ -10,6 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 
@@ -37,10 +40,15 @@ func (h *ShellHandler) HandleOpen(ctx context.Context, p *peer.Peer, chID uint64
 		return nil, nil, err
 	}
 	cmd := exec.Command(path, args...)
-	cmd.Env = os.Environ()
+	// Pin HOME=/ so the shell doesn't try (and fail) to read startup files
+	// under an inaccessible or nonexistent home — e.g. when the daemon runs as
+	// a system user with ProtectHome=yes, which otherwise yields a noisy
+	// "bash: /home/<user>/.bashrc: Permission denied" on every session.
+	env := setEnv(os.Environ(), "HOME", "/")
 	if spec.Term != "" {
-		cmd.Env = append(cmd.Env, "TERM="+spec.Term)
+		env = setEnv(env, "TERM", spec.Term)
 	}
+	cmd.Env = env
 	rows, cols := spec.Rows, spec.Cols
 	if rows == 0 {
 		rows = 24
@@ -52,15 +60,32 @@ func (h *ShellHandler) HandleOpen(ctx context.Context, p *peer.Peer, chID uint64
 	if err != nil {
 		return nil, nil, fmt.Errorf("start shell %s: %w", path, err)
 	}
+	pid := cmd.Process.Pid
 	r := &shellRunner{
-		chID: chID,
-		cmd:  cmd,
-		ptmx: ptmx,
-		desc: fmt.Sprintf("shell %s (pid %d)", path, cmd.Process.Pid),
+		chID:   chID,
+		cmd:    cmd,
+		ptmx:   ptmx,
+		desc:   fmt.Sprintf("shell %s (pid %d)", path, pid),
+		reaped: make(chan struct{}),
 	}
-	// Reap the process and unblock the bridge when the shell exits on its own.
+	// Reap the process and unblock the bridge when the shell exits. Record how
+	// it died so an abnormal exit (e.g. killed by the seccomp sandbox) isn't
+	// silently swallowed — without this the bridge just sees EOF and the CLI
+	// exits 0 with no clue. We classify purely from the wait status: our own
+	// detach teardown kills with SIGKILL (see Close), so a SIGKILL is the
+	// expected "client detached" case and isn't logged; anything else is the
+	// shell's own fate and is logged + propagated as the channel close reason.
 	go func() {
-		_ = cmd.Wait()
+		werr := cmd.Wait()
+		var reason string
+		if killedBy(werr, syscall.SIGKILL) {
+			reason = "detached by client"
+		} else {
+			reason = describeShellExit(werr)
+			p.Logger().Printf("shell %s (pid %d) %s", path, pid, reason)
+		}
+		r.exitReason.Store(reason)
+		close(r.reaped)
 		_ = ptmx.Close()
 	}()
 	return nil, r, nil
@@ -89,17 +114,31 @@ func (h *ShellHandler) HandleStream(ctx context.Context, p *peer.Peer, runner pe
 	sr.Close()         // kill shell + close ptmx (unblocks the pty-side copy)
 	_ = stream.Close() // unblocks the stream-side copy
 	<-done
-	_ = p.CloseChannelByID(sr.chID, "shell ended")
+	// Wait for the reaper to classify the exit so the close reason is the
+	// shell's actual fate, not a guess (the reaper fires promptly: either the
+	// shell already exited, or sr.Close() just SIGKILLed it). Bounded so a
+	// wedged Wait can't hang the channel teardown.
+	reason := "shell ended"
+	select {
+	case <-sr.reaped:
+		if v := sr.exitReason.Load(); v != nil {
+			reason = v.(string)
+		}
+	case <-time.After(2 * time.Second):
+	}
+	_ = p.CloseChannelByID(sr.chID, reason)
 	return nil
 }
 
 // shellRunner is the responder-side state: the spawned shell on a PTY.
 type shellRunner struct {
-	chID      uint64
-	cmd       *exec.Cmd
-	ptmx      *os.File
-	desc      string
-	closeOnce sync.Once
+	chID       uint64
+	cmd        *exec.Cmd
+	ptmx       *os.File
+	desc       string
+	closeOnce  sync.Once
+	reaped     chan struct{} // closed once the reaper has stored exitReason
+	exitReason atomic.Value  // string: how the shell exited (set by the reaper)
 }
 
 func (r *shellRunner) Resize(rows, cols uint16) error {
@@ -108,6 +147,8 @@ func (r *shellRunner) Resize(rows, cols uint16) error {
 
 func (r *shellRunner) Close() error {
 	r.closeOnce.Do(func() {
+		// Kill (SIGKILL) is also how the reaper recognises a detach vs a
+		// self-exit, so don't change the signal here without updating that.
 		if r.cmd != nil && r.cmd.Process != nil {
 			_ = r.cmd.Process.Kill()
 		}
@@ -116,6 +157,55 @@ func (r *shellRunner) Close() error {
 		}
 	})
 	return nil
+}
+
+// describeShellExit renders an exec.Cmd.Wait() result as a short human string,
+// flagging the seccomp case specially since the hardened systemd unit's
+// SystemCallFilter is the most common cause of an instantly-dead shell.
+func describeShellExit(err error) string {
+	if err == nil {
+		return "exited (status 0)"
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			sig := ws.Signal()
+			if sig == syscall.SIGSYS {
+				return "killed by SIGSYS — a syscall was blocked by the sandbox " +
+					"(systemd SystemCallFilter / seccomp); see docs/systemd/bidichan@.service"
+			}
+			return fmt.Sprintf("killed by signal %s", sig)
+		}
+		return fmt.Sprintf("exited (status %d)", ee.ExitCode())
+	}
+	return fmt.Sprintf("wait error: %v", err)
+}
+
+// killedBy reports whether err is an exec failure from the process being
+// terminated by the given signal.
+func killedBy(err error, sig syscall.Signal) bool {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok {
+			return ws.Signaled() && ws.Signal() == sig
+		}
+	}
+	return false
+}
+
+// setEnv returns env with KEY set to val, replacing any existing KEY entries
+// (glibc getenv() honours the first occurrence, so appending a duplicate would
+// not override — the old value must be removed).
+func setEnv(env []string, key, val string) []string {
+	prefix := key + "="
+	out := env[:0:0]
+	for _, e := range env {
+		if len(e) >= len(prefix) && e[:len(prefix)] == prefix {
+			continue
+		}
+		out = append(out, e)
+	}
+	return append(out, prefix+val)
 }
 
 func (r *shellRunner) Description() string { return r.desc }

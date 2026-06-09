@@ -210,6 +210,10 @@ func (p *Peer) Start(ctx context.Context) error {
 // Done returns a channel closed when the peer has shut down.
 func (p *Peer) Done() <-chan struct{} { return p.doneCh }
 
+// Logger returns the peer's logger so channel handlers can report events
+// (e.g. a spawned shell's exit status) through the same sink.
+func (p *Peer) Logger() *log.Logger { return p.logger }
+
 // Close tears down the peer. All channels are closed and the underlying
 // transport is shut.
 func (p *Peer) Close() error {
@@ -442,6 +446,12 @@ func (p *Peer) handleClose(cc CloseChannel) {
 	v, ok := p.channels.LoadAndDelete(cc.ChannelID)
 	if !ok {
 		return
+	}
+	// Surface the peer's reason (e.g. why a shell ended) on this side too — the
+	// CLI that opened the channel only sees the raw byte stream, so the daemon
+	// log is where the reason becomes visible on the originating host.
+	if cc.Reason != "" {
+		p.logger.Printf("peer %s: channel %d closed by peer: %s", p.id, cc.ChannelID, cc.Reason)
 	}
 	st := v.(*channelState)
 	if st.cancel != nil {

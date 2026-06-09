@@ -61,9 +61,9 @@ func TestSanitizeTUNSpec(t *testing.T) {
 			errSub: "invalid CIDR",
 		},
 		{
-			name:   "non-canonical CIDR is rewritten",
-			in:     peer.TUNSpec{CIDR: "10.42.0.1/24"},
-			ok:     true,
+			name: "non-canonical CIDR is rewritten",
+			in:   peer.TUNSpec{CIDR: "10.42.0.1/24"},
+			ok:   true,
 		},
 		{
 			name:   "MTU below IPv4 minimum",
