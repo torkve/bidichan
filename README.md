@@ -225,6 +225,26 @@ channel = socks5 --listen 127.0.0.1:1080
 Malformed specs fail the command immediately. Channels are opened best-effort
 once the peer is up: a failure is logged and the rest still open.
 
+### Running a command over the tunnel
+
+`bidichan connect <profile> [flags] -- <command…>` works like `sudo` or
+`nsenter`: it brings the peer up, opens the configured channels, runs the
+command with inherited stdin/stdout/stderr, then exits with the command's status
+and tears the tunnel down. The channels' listeners are bound *before* the command
+starts, so the command can rely on a forward:
+
+```sh
+bidichan connect myprofile \
+  --channel "forward -L 2222:127.0.0.1:22" \
+  -- ssh -p 2222 user@localhost
+```
+
+When the `ssh` session ends, bidichan exits with ssh's exit code and the tunnel
+is gone. Terminal signals (Ctrl-C, `SIGTERM`, …) are forwarded to the command.
+If the peer connection drops while the command is still running, bidichan prints
+`bidichan: connection to peer lost` to stderr but leaves the command running —
+its own lifetime decides when bidichan exits.
+
 ### Port forwarding
 
 SSH-style shortcuts work and are the simplest path:

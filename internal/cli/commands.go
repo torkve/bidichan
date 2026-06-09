@@ -20,9 +20,11 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -36,10 +38,21 @@ import (
 
 // Execute parses args and runs the chosen subcommand. Returns the
 // process exit code. main() should `os.Exit(cli.Execute(os.Args[1:]))`.
+// exitCodeError carries an explicit process exit code up to Execute. The
+// command-wrapper (`connect … -- cmd`) returns it so bidichan exits with the
+// wrapped command's status.
+type exitCodeError struct{ code int }
+
+func (e *exitCodeError) Error() string { return fmt.Sprintf("exit status %d", e.code) }
+
 func Execute(args []string) int {
 	root := newRootCmd()
 	root.SetArgs(args)
 	if err := root.Execute(); err != nil {
+		var ec *exitCodeError
+		if errors.As(err, &ec) {
+			return ec.code
+		}
 		// cobra already printed the error and usage when appropriate.
 		// Distinguish "the command failed" (1) from "the user typed
 		// it wrong" (2) is hard to do generically with cobra, since
@@ -209,15 +222,28 @@ func newConnectCmd() *cobra.Command {
 		allowShell bool
 	)
 	cmd := &cobra.Command{
-		Use:   "connect [<profile>]",
+		Use:   "connect [<profile>] [-- <command>...]",
 		Short: "Run as the dialing end",
 		Long: `Run as the dialing end. Establishes one peer to the server.
 
 Pass --no-tls-binding when the server is behind a TLS-terminating
 reverse proxy (binding cannot be shared). An optional positional
 profile name (or --config name|path) loads connection settings from
-$XDG_CONFIG_HOME/bidichan/<name>.conf or /etc/bidichan/<name>.conf.`,
-		Args: cobra.MaximumNArgs(1),
+$XDG_CONFIG_HOME/bidichan/<name>.conf or /etc/bidichan/<name>.conf.
+
+With a trailing "-- <command>", bidichan brings up the peer, opens the
+configured channels, runs the command (sudo-style), then exits with the
+command's status and tears the tunnel down.`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			before := args
+			if n := cmd.ArgsLenAtDash(); n >= 0 {
+				before = args[:n]
+			}
+			if len(before) > 1 {
+				return fmt.Errorf("accepts at most one profile name before \"--\", got %d", len(before))
+			}
+			return nil
+		},
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			if len(args) > 0 {
 				return nil, cobra.ShellCompDirectiveNoFileComp
@@ -225,8 +251,15 @@ $XDG_CONFIG_HOME/bidichan/<name>.conf or /etc/bidichan/<name>.conf.`,
 			return ListProfileNames(), cobra.ShellCompDirectiveNoFileComp
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Split the positional profile from a trailing "-- <command>".
 			positional := ""
-			if len(args) > 0 {
+			var command []string
+			if dash := cmd.ArgsLenAtDash(); dash >= 0 {
+				command = args[dash:]
+				if dash > 0 {
+					positional = args[0]
+				}
+			} else if len(args) > 0 {
 				positional = args[0]
 			}
 			logger := log.New(os.Stderr, "bidichan ", log.LstdFlags|log.Lmicroseconds)
@@ -274,7 +307,7 @@ $XDG_CONFIG_HOME/bidichan/<name>.conf or /etc/bidichan/<name>.conf.`,
 				autoChannels = append(autoChannels, ac)
 			}
 
-			d, err := daemon.New(daemon.Config{
+			cfg := daemon.Config{
 				Mode:             daemon.ModeConnect,
 				RemoteAddr:       remote,
 				Hostname:         hostname,
@@ -287,11 +320,20 @@ $XDG_CONFIG_HOME/bidichan/<name>.conf or /etc/bidichan/<name>.conf.`,
 				AllowShell:       allowShell,
 				ControlSocket:    sock,
 				Logger:           logger,
-			})
-			if err != nil {
-				return err
 			}
-			return runDaemon(cmd.Context(), d, logger)
+			if len(command) == 0 {
+				d, err := daemon.New(cfg)
+				if err != nil {
+					return err
+				}
+				return runDaemon(cmd.Context(), d, logger)
+			}
+			// Wrapper mode: bring up the peer, open channels, run the
+			// command, exit with its status. Don't let cobra print usage
+			// or the synthetic exit-code error.
+			cmd.SilenceUsage = true
+			cmd.SilenceErrors = true
+			return runCommand(cmd.Context(), cfg, command, logger)
 		},
 	}
 	f := cmd.Flags()
@@ -335,6 +377,85 @@ func runDaemon(parent context.Context, d *daemon.Daemon, logger *log.Logger) err
 		return err
 	}
 	return nil
+}
+
+// runCommand implements wrapper mode (`connect … -- <command>`): it brings the
+// peer up, opens the configured channels, then runs the command with inherited
+// stdio (sudo-style) and returns an exit code matching the command's. The
+// channels' listeners are bound before the command starts (the daemon fires
+// OnReady only after openAutoChannels), so a command can rely on a forward.
+func runCommand(parent context.Context, cfg daemon.Config, command []string, logger *log.Logger) error {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+
+	ready := make(chan struct{})
+	cfg.OnReady = func() { close(ready) }
+	// cmdDone guards OnPeerDown so we only announce tunnel loss while the
+	// command is still running — not during the normal teardown we trigger
+	// ourselves once the command exits.
+	var cmdDone atomic.Bool
+	cfg.OnPeerDown = func() {
+		if !cmdDone.Load() {
+			fmt.Fprintln(os.Stderr, "bidichan: connection to peer lost")
+		}
+	}
+
+	d, err := daemon.New(cfg)
+	if err != nil {
+		return err
+	}
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- d.Run(ctx) }()
+
+	// Wait until the peer is up and channels are bound, or the daemon fails
+	// first (dial/auth error → exit 1, command never runs).
+	select {
+	case <-ready:
+	case err := <-runErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+		return errors.New("connect: peer ended before it was ready")
+	}
+
+	c := exec.Command(command[0], command[1:]...)
+	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+	c.Env = os.Environ()
+	if err := c.Start(); err != nil {
+		cmdDone.Store(true)
+		_ = d.Close()
+		cancel()
+		<-runErr
+		return fmt.Errorf("run %s: %w", command[0], err)
+	}
+
+	// Forward terminal signals to the child like sudo does. The child shares
+	// our tty/process group, so an interactive Ctrl-C reaches it directly too;
+	// this also covers non-tty invocations.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+	go func() {
+		for s := range sigCh {
+			if c.Process != nil {
+				_ = c.Process.Signal(s)
+			}
+		}
+	}()
+
+	werr := c.Wait()
+	cmdDone.Store(true)
+	signal.Stop(sigCh)
+	close(sigCh)
+	_ = d.Close()
+	cancel()
+	<-runErr
+
+	var ee *exec.ExitError
+	if errors.As(werr, &ee) {
+		return &exitCodeError{code: ee.ExitCode()}
+	}
+	return werr
 }
 
 // --- status ---

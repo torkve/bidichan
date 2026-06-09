@@ -98,6 +98,15 @@ type Config struct {
 	// continue. Parsed from the connect `--channel` flag / `channel =` config.
 	AutoChannels []AutoChannel
 
+	// OnReady, if set (connect side), is called once after the peer is up and
+	// the auto-channels have been opened. Used by the command-wrapper to run
+	// the user's command only after the channels' listeners are bound.
+	OnReady func()
+
+	// OnPeerDown, if set, is called when a peer's session ends. Used by the
+	// command-wrapper to surface tunnel loss to the user.
+	OnPeerDown func()
+
 	// Logger; default if nil.
 	Logger *log.Logger
 }
@@ -201,7 +210,7 @@ func (d *Daemon) runListen(ctx context.Context) error {
 		d.wg.Add(1)
 		go func() {
 			defer d.wg.Done()
-			if err := d.adoptPeer(ctx, c, peer.RoleServer); err != nil {
+			if _, err := d.adoptPeer(ctx, c, peer.RoleServer); err != nil {
 				d.logger.Printf("adopt peer: %v", err)
 				_ = c.Close()
 			}
@@ -232,41 +241,50 @@ func (d *Daemon) runConnect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := d.adoptPeer(ctx, c, peer.RoleClient); err != nil {
+	p, err := d.adoptPeer(ctx, c, peer.RoleClient)
+	if err != nil {
 		_ = c.Close()
 		return err
+	}
+	// Open the configured channels (best-effort) before signalling ready, so a
+	// command wrapper only runs once their listeners are bound.
+	if len(d.cfg.AutoChannels) > 0 {
+		d.openAutoChannels(ctx, p)
+	}
+	if d.cfg.OnReady != nil {
+		d.cfg.OnReady()
 	}
 	// Wait until shutdown.
 	<-ctx.Done()
 	return nil
 }
 
-func (d *Daemon) adoptPeer(ctx context.Context, conn net.Conn, role peer.Role) error {
+func (d *Daemon) adoptPeer(ctx context.Context, conn net.Conn, role peer.Role) (*peer.Peer, error) {
 	id, _ := randomID()
 	p, err := peer.NewPeer(role, conn, id, d.logger)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	channel.Register(p)
 	channel.RegisterShell(p, d.cfg.AllowShell)
 	if err := p.Start(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	d.mu.Lock()
 	d.peers[id] = p
 	d.mu.Unlock()
 	d.logger.Printf("peer %s up (remote=%s local=%s role=%v)", id, p.RemoteAddr(), p.LocalAddr(), role)
-	if len(d.cfg.AutoChannels) > 0 {
-		go d.openAutoChannels(ctx, p)
-	}
 	go func() {
 		<-p.Done()
 		d.mu.Lock()
 		delete(d.peers, id)
 		d.mu.Unlock()
 		d.logger.Printf("peer %s down", id)
+		if d.cfg.OnPeerDown != nil {
+			d.cfg.OnPeerDown()
+		}
 	}()
-	return nil
+	return p, nil
 }
 
 // openAutoChannels opens each configured AutoChannel on p, in order, best-effort.
