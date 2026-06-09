@@ -327,6 +327,13 @@ func (p *Peer) dispatch(ctx context.Context, env Envelope) error {
 		}
 		p.handleClose(cc)
 		return nil
+	case MsgChannelResize:
+		var rz ChannelResize
+		if err := json.Unmarshal(env.Payload, &rz); err != nil {
+			return err
+		}
+		p.handleResize(rz)
+		return nil
 	case MsgPing:
 		return p.ctrl.send(Envelope{Type: MsgPong})
 	case MsgPong:
@@ -390,6 +397,45 @@ func (p *Peer) handleAck(ctx context.Context, ack OpenAck, err error) error {
 	pend := v.(*pendingOpen)
 	pend.done <- pendingOpenResult{info: ack.Info, err: err}
 	return nil
+}
+
+// ResizableChannel is implemented by a channel runner whose terminal size can
+// be updated (the shell kind).
+type ResizableChannel interface {
+	Resize(rows, cols uint16) error
+}
+
+// StreamChannel is implemented by an originator-side channel runner that
+// exposes a single bidirectional data stream for direct bridging (the shell
+// kind), so the daemon's control handler can splice a CLI connection to it.
+type StreamChannel interface {
+	Stream() net.Conn
+}
+
+func (p *Peer) handleResize(rz ChannelResize) {
+	v, ok := p.channels.Load(rz.ChannelID)
+	if !ok {
+		return
+	}
+	if r, ok := v.(*channelState).runner.(ResizableChannel); ok {
+		_ = r.Resize(rz.Rows, rz.Cols)
+	}
+}
+
+// SendChannelResize notifies the peer of a new terminal size for a channel.
+func (p *Peer) SendChannelResize(chID uint64, rows, cols uint16) error {
+	return p.ctrl.send(Envelope{Type: MsgChannelResize, Payload: mustJSON(ChannelResize{
+		ChannelID: chID, Rows: rows, Cols: cols,
+	})})
+}
+
+// ChannelRunner returns the runner for an open channel, if present.
+func (p *Peer) ChannelRunner(chID uint64) (ChannelRunner, bool) {
+	v, ok := p.channels.Load(chID)
+	if !ok {
+		return nil, false
+	}
+	return v.(*channelState).runner, true
 }
 
 func (p *Peer) handleClose(cc CloseChannel) {

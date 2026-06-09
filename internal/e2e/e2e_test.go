@@ -69,6 +69,7 @@ func pair(t *testing.T, hostname string) (*peer.Peer, *peer.Peer, func()) {
 			return
 		}
 		channel.Register(p)
+		channel.RegisterShell(p, true)
 		if err := p.Start(ctx); err != nil {
 			errCh <- err
 			return
@@ -93,6 +94,7 @@ func pair(t *testing.T, hostname string) (*peer.Peer, *peer.Peer, func()) {
 		t.Fatalf("NewPeer client: %v", err)
 	}
 	channel.Register(cliPeer)
+	channel.RegisterShell(cliPeer, true)
 	if err := cliPeer.Start(ctx); err != nil {
 		cancel()
 		_ = lis.Close()

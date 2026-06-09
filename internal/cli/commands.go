@@ -29,6 +29,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"golang.org/x/term"
 
 	"github.com/torkve/bidichan/internal/daemon"
 )
@@ -93,6 +94,7 @@ func newListenCmd() *cobra.Command {
 		sock         string
 		decoyBackend string
 		wsPath       string
+		allowShell   bool
 	)
 	cmd := &cobra.Command{
 		Use:   "listen [<profile>]",
@@ -161,6 +163,7 @@ or /etc/bidichan/<name>.conf.`,
 				TransportNetwork: network,
 				DecoyBackend:     decoyBackend,
 				Path:             wsPath,
+				AllowShell:       allowShell,
 				ControlSocket:    sock,
 				Logger:           logger,
 			})
@@ -181,6 +184,7 @@ or /etc/bidichan/<name>.conf.`,
 	f.StringVar(&keyPath, "key", "", "TLS key PEM; ignored in unix-socket mode")
 	f.StringVar(&decoyBackend, "decoy-backend", "", "proxy unauthenticated connections to this real web backend (host:port or unix:/path) instead of the built-in static page")
 	f.StringVar(&wsPath, "path", "", "WebSocket upgrade request path (default: derived from the PSK; logged at startup)")
+	f.BoolVar(&allowShell, "allow-shell", false, "allow the peer to open an interactive shell on this host (grants the peer RCE)")
 	f.StringVar(&sock, "socket", "", "local CLI control socket path (default $XDG_RUNTIME_DIR/bidichan-<pid>.sock)")
 
 	_ = cmd.RegisterFlagCompletionFunc("config", profileFlagCompletion)
@@ -191,17 +195,18 @@ or /etc/bidichan/<name>.conf.`,
 
 func newConnectCmd() *cobra.Command {
 	var (
-		configSrc string
-		addr      string
-		unixPath  string
-		hostname  string
-		pskHex    string
-		pskFile   string
-		noBind    bool
-		sock      string
-		wsPath    string
-		caCert    string
-		channels  []string
+		configSrc  string
+		addr       string
+		unixPath   string
+		hostname   string
+		pskHex     string
+		pskFile    string
+		noBind     bool
+		sock       string
+		wsPath     string
+		caCert     string
+		channels   []string
+		allowShell bool
 	)
 	cmd := &cobra.Command{
 		Use:   "connect [<profile>]",
@@ -279,6 +284,7 @@ $XDG_CONFIG_HOME/bidichan/<name>.conf or /etc/bidichan/<name>.conf.`,
 				Path:             wsPath,
 				CACert:           caCert,
 				AutoChannels:     autoChannels,
+				AllowShell:       allowShell,
 				ControlSocket:    sock,
 				Logger:           logger,
 			})
@@ -299,6 +305,7 @@ $XDG_CONFIG_HOME/bidichan/<name>.conf or /etc/bidichan/<name>.conf.`,
 	f.StringVar(&wsPath, "path", "", "WebSocket upgrade request path (default: derived from the PSK; must match the server)")
 	f.StringVar(&caCert, "cacert", "", "PEM bundle to verify the server cert against (for self-signed / private CA); default: system trust store")
 	f.StringArrayVar(&channels, "channel", nil, "channel to open once connected, e.g. \"forward -L 8080:host:80\" (repeatable; same syntax as 'channel open')")
+	f.BoolVar(&allowShell, "allow-shell", false, "allow the peer to open an interactive shell on this host (grants the peer RCE)")
 	f.StringVar(&sock, "socket", "", "local CLI control socket path")
 
 	_ = cmd.RegisterFlagCompletionFunc("config", profileFlagCompletion)
@@ -428,14 +435,91 @@ func newChannelCmd() *cobra.Command {
 func newChannelOpenCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "open",
-		Short: "Open a forward / http / socks5 / tun channel",
+		Short: "Open a forward / http / socks5 / tun / shell channel",
 	}
 	cmd.AddCommand(
 		newChannelOpenForwardCmd(),
 		newChannelOpenProxyCmd("http", daemon.ActionOpenHTTP),
 		newChannelOpenProxyCmd("socks5", daemon.ActionOpenSocks5),
 		newChannelOpenTUNCmd(),
+		newChannelOpenShellCmd(),
 	)
+	return cmd
+}
+
+func newChannelOpenShellCmd() *cobra.Command {
+	var (
+		sock   string
+		peerID string
+	)
+	cmd := &cobra.Command{
+		Use:   "shell",
+		Short: "Open an interactive shell on the remote peer (needs the peer's --allow-shell)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			stdinFd := int(os.Stdin.Fd())
+			if !term.IsTerminal(stdinFd) {
+				return errors.New("shell requires an interactive terminal (stdin is not a tty)")
+			}
+			cols, rows, err := term.GetSize(stdinFd)
+			if err != nil {
+				cols, rows = 80, 24
+			}
+
+			dc, err := DialCtrl(sock)
+			if err != nil {
+				return err
+			}
+			defer dc.Close()
+			data, err := dc.Call(daemon.ActionOpenShell, daemon.OpenShellArgs{
+				PeerID: peerID,
+				Shell:  os.Getenv("SHELL"),
+				Term:   os.Getenv("TERM"),
+				Rows:   uint16(rows),
+				Cols:   uint16(cols),
+			})
+			if err != nil {
+				return err // includes the remote nack ("shell not permitted ...")
+			}
+			var resp daemon.OpenResponse
+			_ = json.Unmarshal(data, &resp)
+			chID := resp.ChannelID
+			_ = dc.conn.SetDeadline(time.Time{}) // long-lived raw bridge
+
+			// Separate control connection for window-resize events.
+			rc, rcErr := DialCtrl(sock)
+			if rcErr == nil {
+				defer rc.Close()
+			}
+
+			old, err := term.MakeRaw(stdinFd)
+			if err != nil {
+				return fmt.Errorf("raw mode: %w", err)
+			}
+			defer func() { _ = term.Restore(stdinFd, old) }()
+
+			winch := make(chan os.Signal, 1)
+			signal.Notify(winch, syscall.SIGWINCH)
+			defer signal.Stop(winch)
+			go func() {
+				for range winch {
+					cols, rows, err := term.GetSize(stdinFd)
+					if err != nil || rc == nil {
+						continue
+					}
+					_, _ = rc.Call(daemon.ActionResizeShell, daemon.ResizeShellArgs{
+						PeerID: peerID, ChannelID: chID, Rows: uint16(rows), Cols: uint16(cols),
+					})
+				}
+			}()
+
+			go func() { _, _ = io.Copy(dc.conn, os.Stdin) }() // local stdin -> remote PTY
+			_, _ = io.Copy(os.Stdout, dc.r)                   // remote PTY -> local stdout
+			return nil
+		},
+	}
+	f := cmd.Flags()
+	f.StringVar(&sock, "socket", "", "daemon socket")
+	f.StringVar(&peerID, "peer", "", "peer id (prefix ok)")
 	return cmd
 }
 

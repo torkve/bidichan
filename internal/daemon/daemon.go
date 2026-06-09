@@ -88,6 +88,11 @@ type Config struct {
 	// daemon. Optional.
 	PIDFile string
 
+	// AllowShell lets the other peer open an interactive shell on this host
+	// (the daemon spawns a PTY-backed shell). Default false. Originating a
+	// shell on the peer is always allowed regardless of this setting.
+	AllowShell bool
+
 	// AutoChannels are channels opened automatically, in order, once a peer is
 	// established (connect side). Best-effort: a failure is logged and the rest
 	// continue. Parsed from the connect `--channel` flag / `channel =` config.
@@ -243,6 +248,7 @@ func (d *Daemon) adoptPeer(ctx context.Context, conn net.Conn, role peer.Role) e
 		return err
 	}
 	channel.Register(p)
+	channel.RegisterShell(p, d.cfg.AllowShell)
 	if err := p.Start(ctx); err != nil {
 		return err
 	}

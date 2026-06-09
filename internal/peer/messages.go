@@ -9,12 +9,13 @@ import "encoding/json"
 type MsgType string
 
 const (
-	MsgOpenChannel  MsgType = "open"
-	MsgOpenAck      MsgType = "open_ack"
-	MsgOpenNack     MsgType = "open_nack"
-	MsgCloseChannel MsgType = "close"
-	MsgPing         MsgType = "ping"
-	MsgPong         MsgType = "pong"
+	MsgOpenChannel   MsgType = "open"
+	MsgOpenAck       MsgType = "open_ack"
+	MsgOpenNack      MsgType = "open_nack"
+	MsgCloseChannel  MsgType = "close"
+	MsgChannelResize MsgType = "resize"
+	MsgPing          MsgType = "ping"
+	MsgPong          MsgType = "pong"
 )
 
 // ChannelKind picks the channel implementation. The control message carries
@@ -24,10 +25,11 @@ const (
 type ChannelKind string
 
 const (
-	KindForward   ChannelKind = "forward"   // raw TCP forwarding
-	KindHTTPProxy ChannelKind = "http"      // local HTTP proxy listener
-	KindSocks5    ChannelKind = "socks5"    // local SOCKS5 proxy listener
-	KindTUN       ChannelKind = "tun"       // packet-mode TUN device
+	KindForward   ChannelKind = "forward" // raw TCP forwarding
+	KindHTTPProxy ChannelKind = "http"    // local HTTP proxy listener
+	KindSocks5    ChannelKind = "socks5"  // local SOCKS5 proxy listener
+	KindTUN       ChannelKind = "tun"     // packet-mode TUN device
+	KindShell     ChannelKind = "shell"   // interactive PTY-backed shell
 )
 
 // Side identifies which peer hosts the listener / proxy / tun device. From the
@@ -72,6 +74,14 @@ type OpenNack struct {
 	Reason    string `json:"reason"`
 }
 
+// ChannelResize carries a terminal window-size update for an interactive
+// channel (the shell kind). The responder applies it to the PTY.
+type ChannelResize struct {
+	ChannelID uint64 `json:"id"`
+	Rows      uint16 `json:"rows"`
+	Cols      uint16 `json:"cols"`
+}
+
 // CloseChannel asks the peer to tear down the named channel. Either side may
 // initiate close; the receiver should release listener/socket resources and
 // any in-flight streams will be reset by yamux automatically when their
@@ -107,6 +117,17 @@ type TUNSpec struct {
 	CIDR    string `json:"cidr,omitempty"`
 	MTU     int    `json:"mtu,omitempty"`
 	Label   string `json:"label,omitempty"`
+}
+
+// ShellSpec configures an interactive shell channel. The shell is spawned on
+// the responder (remote) side on a PTY; the originator attaches its terminal.
+// Shell is the originator's $SHELL, tried first on the responder before the
+// built-in fallback list. Rows/Cols/Term seed the PTY.
+type ShellSpec struct {
+	Shell string `json:"shell,omitempty"`
+	Term  string `json:"term,omitempty"`
+	Rows  uint16 `json:"rows,omitempty"`
+	Cols  uint16 `json:"cols,omitempty"`
 }
 
 // AckInfoListener is returned in OpenAck when the responder is the one that

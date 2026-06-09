@@ -13,6 +13,7 @@ Channel kinds:
 | http     | HTTP proxy (CONNECT + absolute-URI) terminating on the peer   |
 | socks5   | SOCKS5 proxy (CONNECT, no-auth) terminating on the peer       |
 | tun      | L3 TUN device with packets framed across one yamux stream     |
+| shell    | interactive PTY-backed shell on the peer (needs `--allow-shell`) |
 
 Any connection with the wrong SNI, the wrong PSK, or an ordinary HTTPS request
 is transparently proxied to a real web backend you configure (`--decoy-backend`),
@@ -279,6 +280,27 @@ sudo bidichan channel open tun --tun-side local --cidr 10.42.0.2/24 --name bc0
 
 You then add routes (`ip route add ... dev bc0`) as you'd configure any
 point-to-point link.
+
+### Interactive shell
+
+Open an interactive, PTY-backed shell on the **other** peer and attach your
+local terminal to it (raw mode; window resizes are forwarded):
+
+```sh
+bidichan channel open shell
+```
+
+The remote spawns the first available of: your `$SHELL` (if it exists there),
+`/usr/bin/bash`, `/bin/bash`, `busybox sh`, `/bin/sh`. Closing the shell
+(`exit` / Ctrl-D) or disconnecting tears the channel down and kills the remote
+process.
+
+The peer only spawns a shell if it was started with **`--allow-shell`** (on
+`listen` *or* `connect`); without it the open is refused. This is deliberate:
+`--allow-shell` grants whoever holds the PSK a full interactive shell — i.e.
+remote code execution — on that host, so enable it only on hosts you intend to
+administer over the link. Requires an interactive terminal (a TTY) on the side
+running the command.
 
 ### Close a channel
 

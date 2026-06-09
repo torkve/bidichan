@@ -31,13 +31,15 @@ type CtrlResponse struct {
 }
 
 const (
-	ActionStatus       = "status"
-	ActionOpenForward  = "open_forward"
-	ActionOpenHTTP     = "open_http"
-	ActionOpenSocks5   = "open_socks5"
-	ActionOpenTUN      = "open_tun"
-	ActionClose        = "close_channel"
-	ActionShutdown     = "shutdown"
+	ActionStatus      = "status"
+	ActionOpenForward = "open_forward"
+	ActionOpenHTTP    = "open_http"
+	ActionOpenSocks5  = "open_socks5"
+	ActionOpenTUN     = "open_tun"
+	ActionOpenShell   = "open_shell"
+	ActionResizeShell = "resize_shell"
+	ActionClose       = "close_channel"
+	ActionShutdown    = "shutdown"
 )
 
 // StatusResponse summarises every peer and its open channels.
@@ -47,12 +49,12 @@ type StatusResponse struct {
 
 // PeerStatus describes one peer for the CLI.
 type PeerStatus struct {
-	ID         string                 `json:"id"`
-	Remote     string                 `json:"remote"`
-	Local      string                 `json:"local"`
-	StartedAt  time.Time              `json:"started_at"`
-	Mode       string                 `json:"mode"`
-	Channels   []peer.ChannelSnapshot `json:"channels"`
+	ID        string                 `json:"id"`
+	Remote    string                 `json:"remote"`
+	Local     string                 `json:"local"`
+	StartedAt time.Time              `json:"started_at"`
+	Mode      string                 `json:"mode"`
+	Channels  []peer.ChannelSnapshot `json:"channels"`
 }
 
 // OpenForwardArgs / OpenProxyArgs / OpenTUNArgs / CloseArgs are the
@@ -85,6 +87,25 @@ type OpenTUNArgs struct {
 type CloseArgs struct {
 	PeerID    string `json:"peer_id"`
 	ChannelID uint64 `json:"channel_id"`
+}
+
+// OpenShellArgs opens an interactive shell on the peer. After the daemon acks
+// with the channel id, the control connection is hijacked into a raw byte pipe
+// between the CLI's terminal and the channel's data stream.
+type OpenShellArgs struct {
+	PeerID string `json:"peer_id"`
+	Shell  string `json:"shell,omitempty"` // the CLI's $SHELL
+	Term   string `json:"term,omitempty"`
+	Rows   uint16 `json:"rows,omitempty"`
+	Cols   uint16 `json:"cols,omitempty"`
+}
+
+// ResizeShellArgs forwards a terminal window-size change to the remote PTY.
+type ResizeShellArgs struct {
+	PeerID    string `json:"peer_id"`
+	ChannelID uint64 `json:"channel_id"`
+	Rows      uint16 `json:"rows"`
+	Cols      uint16 `json:"cols"`
 }
 
 // OpenResponse echoes the new channel id back to the CLI.
@@ -137,6 +158,12 @@ func (d *Daemon) handleCtrl(c net.Conn) {
 			writeCtrlErr(bw, fmt.Errorf("parse request: %w", err))
 			return
 		}
+		if req.Action == ActionOpenShell {
+			// Hijacks the connection into a raw bidirectional pipe; returns
+			// when the shell session ends.
+			d.handleShellCtrl(c, br, bw, req)
+			return
+		}
 		resp := d.dispatchCtrl(req)
 		b, _ := json.Marshal(resp)
 		_, _ = bw.Write(b)
@@ -186,6 +213,12 @@ func (d *Daemon) dispatchCtrl(req CtrlRequest) CtrlResponse {
 			return ctrlErr(err)
 		}
 		return d.ctrlOpenTUN(args)
+	case ActionResizeShell:
+		var args ResizeShellArgs
+		if err := json.Unmarshal(req.Args, &args); err != nil {
+			return ctrlErr(err)
+		}
+		return d.ctrlResizeShell(args)
 	case ActionClose:
 		var args CloseArgs
 		if err := json.Unmarshal(req.Args, &args); err != nil {
@@ -352,6 +385,83 @@ func (d *Daemon) ctrlCloseChannel(args CloseArgs) CtrlResponse {
 		return ctrlErr(err)
 	}
 	return ctrlOK(map[string]bool{"ok": true})
+}
+
+func (d *Daemon) ctrlResizeShell(args ResizeShellArgs) CtrlResponse {
+	p, err := d.requirePeer(args.PeerID)
+	if err != nil {
+		return ctrlErr(err)
+	}
+	if err := p.SendChannelResize(args.ChannelID, args.Rows, args.Cols); err != nil {
+		return ctrlErr(err)
+	}
+	return ctrlOK(map[string]bool{"ok": true})
+}
+
+// handleShellCtrl opens a shell channel on the peer and then hijacks the
+// control connection into a raw bidirectional pipe between the CLI's terminal
+// and the channel's data stream. It returns when the session ends, after which
+// handleCtrl closes the connection.
+func (d *Daemon) handleShellCtrl(c net.Conn, br *bufio.Reader, bw *bufio.Writer, req CtrlRequest) {
+	var args OpenShellArgs
+	if err := json.Unmarshal(req.Args, &args); err != nil {
+		writeCtrlErr(bw, err)
+		_ = bw.Flush()
+		return
+	}
+	p, err := d.requirePeer(args.PeerID)
+	if err != nil {
+		writeCtrlErr(bw, err)
+		_ = bw.Flush()
+		return
+	}
+	// The open handshake gets a bounded timeout; the channel itself is not
+	// tied to this context (the shell handler keys liveness off the stream).
+	octx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	chID, err := p.OpenChannel(octx, peer.KindShell, peer.ShellSpec{
+		Shell: args.Shell, Term: args.Term, Rows: args.Rows, Cols: args.Cols,
+	})
+	cancel()
+	if err != nil {
+		writeCtrlErr(bw, err) // e.g. "shell not permitted ..."
+		_ = bw.Flush()
+		return
+	}
+	runner, ok := p.ChannelRunner(chID)
+	if !ok {
+		writeCtrlErr(bw, errors.New("shell channel vanished"))
+		_ = bw.Flush()
+		return
+	}
+	sc, ok := runner.(peer.StreamChannel)
+	if !ok {
+		_ = p.CloseChannelByID(chID, "internal error")
+		writeCtrlErr(bw, errors.New("shell channel has no stream"))
+		_ = bw.Flush()
+		return
+	}
+	stream := sc.Stream()
+
+	// Ack with the channel id, then switch this connection to a raw pipe.
+	ack, _ := json.Marshal(CtrlResponse{Data: mustJSONDaemon(OpenResponse{ChannelID: chID})})
+	_, _ = bw.Write(ack)
+	_, _ = bw.Write([]byte("\n"))
+	_ = bw.Flush()
+
+	_ = c.SetDeadline(time.Time{}) // long-lived; no per-request deadline
+
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(stream, br); done <- struct{}{} }() // CLI stdin -> remote PTY
+	go func() { _, _ = io.Copy(c, stream); done <- struct{}{} }()  // remote PTY -> CLI stdout
+	<-done
+	_ = p.CloseChannelByID(chID, "shell detached")
+	_ = c.Close()
+	<-done
+}
+
+func mustJSONDaemon(v any) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 // FormatBoundAddr extracts the BoundAddr field from an AckInfoListener-style

@@ -31,6 +31,7 @@ type profileValues struct {
 	Path         *string
 	CACert       *string
 	Channels     []string // repeatable: one entry per `channel =` line
+	AllowShell   *bool
 }
 
 // loadProfile resolves a profile source — either an explicit path passed
@@ -219,8 +220,14 @@ func applyKey(out *profileValues, key, val string) error {
 		out.CACert = strPtr(expandPath(val))
 	case "channel":
 		out.Channels = append(out.Channels, val)
+	case "allow-shell":
+		b, err := parseBool(val)
+		if err != nil {
+			return fmt.Errorf("allow-shell: %w", err)
+		}
+		out.AllowShell = &b
 	default:
-		return fmt.Errorf("unknown key %q (known keys: addr, unix-socket, hostname, psk, psk-file, no-tls-binding, cert, key, socket, decoy-backend, path, cacert, channel)", key)
+		return fmt.Errorf("unknown key %q (known keys: addr, unix-socket, hostname, psk, psk-file, no-tls-binding, cert, key, socket, decoy-backend, path, cacert, channel, allow-shell)", key)
 	}
 	return nil
 }
@@ -346,6 +353,13 @@ func applyProfile(fs *pflag.FlagSet, source string, logger *log.Logger) (string,
 			for _, ch := range v.Channels {
 				_ = f.Value.Set(ch)
 			}
+		}
+	}
+	if v.AllowShell != nil {
+		if *v.AllowShell {
+			set("allow-shell", "true")
+		} else {
+			set("allow-shell", "false")
 		}
 	}
 	return path, nil
