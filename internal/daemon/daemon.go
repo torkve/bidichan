@@ -254,9 +254,18 @@ func (d *Daemon) runConnect(ctx context.Context) error {
 	if d.cfg.OnReady != nil {
 		d.cfg.OnReady()
 	}
-	// Wait until shutdown.
-	<-ctx.Done()
-	return nil
+	// Run until shutdown is requested or the peer connection drops. A connect
+	// daemon owns a single outbound peer and does not reconnect, so peer loss
+	// is terminal: return an error so the process exits non-zero (a systemd
+	// unit with Restart=on-failure then redials). The command wrapper handles
+	// its own lifetime — it ignores this return and keeps the command running
+	// after surfacing the loss via OnPeerDown.
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-p.Done():
+		return errors.New("peer connection lost")
+	}
 }
 
 func (d *Daemon) adoptPeer(ctx context.Context, conn net.Conn, role peer.Role) (*peer.Peer, error) {

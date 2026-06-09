@@ -172,7 +172,8 @@ func TestConnectOnPeerDown(t *testing.T) {
 		t.Fatal(err)
 	}
 	cliCtx, cliCancel := context.WithCancel(context.Background())
-	go cli.Run(cliCtx)
+	runErr := make(chan error, 1)
+	go func() { runErr <- cli.Run(cliCtx) }()
 	t.Cleanup(func() { cliCancel(); _ = cli.Close() })
 
 	select {
@@ -191,6 +192,17 @@ func TestConnectOnPeerDown(t *testing.T) {
 	case <-down:
 	case <-time.After(5 * time.Second):
 		t.Fatal("OnPeerDown never fired after peer loss")
+	}
+
+	// The connect daemon must not hang after losing its only peer: Run returns
+	// a non-nil error so the process exits non-zero (Restart=on-failure redials).
+	select {
+	case err := <-runErr:
+		if err == nil {
+			t.Fatal("connect daemon Run returned nil on peer loss; want an error so it exits non-zero")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("connect daemon did not exit after peer loss")
 	}
 }
 
