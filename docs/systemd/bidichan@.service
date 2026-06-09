@@ -64,6 +64,14 @@ SystemCallArchitectures=native
 # bidichan does normal network + filesystem work; this filter is roomy.
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+# Re-allow the credential-setting syscalls @privileged strips. An
+# interactive shell opened via --allow-shell calls setfsuid()/setuid()
+# during startup (glibc/bash) and is killed with SIGSYS without them, so
+# `channel open shell` silently produces a dead session. This is safe:
+# the daemon runs as a non-root user with NoNewPrivileges=yes, so these
+# calls cannot escalate privileges — the filter was only killing the
+# process for invoking them. Harmless for instances that don't use shells.
+SystemCallFilter=setuid setgid setgroups setfsuid setfsgid setreuid setregid setresuid setresgid
 ProtectClock=yes
 ProtectHostname=yes
 
