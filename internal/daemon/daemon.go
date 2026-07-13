@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	utls "github.com/refraction-networking/utls"
+
 	"github.com/torkve/bidichan/internal/channel"
 	"github.com/torkve/bidichan/internal/peer"
 	"github.com/torkve/bidichan/internal/transport"
@@ -80,9 +82,26 @@ type Config struct {
 	// pin a self-signed certificate or a private CA. Empty uses system roots.
 	CACert string
 
+	// RootCAs, when non-nil, is used directly as the connect-side trust store
+	// (bypassing CACert file reading). Set by embedders that hold the CA in
+	// memory rather than on disk (the iOS mobile facade). Takes precedence over
+	// CACert.
+	RootCAs *x509.CertPool
+
+	// HelloID selects the uTLS ClientHello fingerprint on the connect side.
+	// The zero value keeps the default (Chrome); the mobile client sets it to
+	// an iOS/Safari fingerprint. Ignored on the listen side.
+	HelloID utls.ClientHelloID
+
 	// ControlSocket is the Unix socket path where the local CLI talks to us.
 	// Defaults to $XDG_RUNTIME_DIR/bidichan-<pid>.sock or /tmp fallback.
 	ControlSocket string
+
+	// EmbedControl runs the daemon without binding the Unix control socket.
+	// Used when the daemon is embedded as a library (the iOS mobile facade),
+	// where the host drives it in-process via Daemon.ControlJSON instead of
+	// over a socket. The CLI leaves this false.
+	EmbedControl bool
 
 	// PIDFile is written so the CLI's auto-discovery can find a running
 	// daemon. Optional.
@@ -156,8 +175,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.cancelMu.Unlock()
 	defer cancel()
 
-	if err := d.startCtrl(); err != nil {
-		return fmt.Errorf("ctrl socket: %w", err)
+	if !d.cfg.EmbedControl {
+		if err := d.startCtrl(); err != nil {
+			return fmt.Errorf("ctrl socket: %w", err)
+		}
 	}
 
 	if d.cfg.PIDFile != "" {
@@ -220,7 +241,10 @@ func (d *Daemon) runListen(ctx context.Context) error {
 
 func (d *Daemon) runConnect(ctx context.Context) error {
 	var rootCAs *x509.CertPool
-	if d.cfg.CACert != "" {
+	switch {
+	case d.cfg.RootCAs != nil:
+		rootCAs = d.cfg.RootCAs
+	case d.cfg.CACert != "":
 		pem, err := os.ReadFile(d.cfg.CACert)
 		if err != nil {
 			return fmt.Errorf("read --cacert: %w", err)
@@ -237,6 +261,7 @@ func (d *Daemon) runConnect(ctx context.Context) error {
 		Network:     d.cfg.TransportNetwork,
 		SkipBinding: d.cfg.SkipBinding,
 		Path:        d.cfg.Path,
+		HelloID:     d.cfg.HelloID,
 	})
 	if err != nil {
 		return err

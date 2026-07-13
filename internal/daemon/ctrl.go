@@ -232,6 +232,28 @@ func (d *Daemon) dispatchCtrl(req CtrlRequest) CtrlResponse {
 	}
 }
 
+// ControlJSON handles one control request encoded as JSON and returns the
+// JSON-encoded CtrlResponse. It is the in-process equivalent of a single
+// request/response exchange on the control socket, for embedders (the iOS
+// mobile facade) that drive the daemon as a library without a Unix socket.
+// The response payload matches what the socket path returns for the same
+// request (the socket additionally appends a trailing newline as a frame
+// delimiter, which is not needed here). It does NOT support the shell action,
+// which on the socket hijacks
+// the connection into a raw byte pipe (handled in handleCtrl, not dispatchCtrl);
+// embedders open shells via a dedicated stream API instead. Sending "open_shell"
+// therefore yields an "unknown action" error, and "shutdown" acks without
+// stopping the daemon (embedders call Close directly).
+func (d *Daemon) ControlJSON(reqJSON []byte) []byte {
+	var req CtrlRequest
+	if err := json.Unmarshal(reqJSON, &req); err != nil {
+		b, _ := json.Marshal(CtrlResponse{Error: fmt.Sprintf("parse request: %v", err)})
+		return b
+	}
+	b, _ := json.Marshal(d.dispatchCtrl(req))
+	return b
+}
+
 func ctrlErr(err error) CtrlResponse {
 	return CtrlResponse{Error: err.Error()}
 }

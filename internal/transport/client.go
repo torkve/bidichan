@@ -49,6 +49,13 @@ type ClientConfig struct {
 	// PSK-specific path (the default), matching what the server expects. Set
 	// it explicitly to match a fixed reverse-proxy location.
 	Path string
+
+	// HelloID selects the uTLS ClientHello fingerprint to mimic. The zero
+	// value keeps the default (current Chrome, ECH stripped) so the CLI is
+	// unchanged; the mobile client sets it to utls.HelloIOS_Auto /
+	// HelloSafari_Auto so an iPhone presents a Safari-family fingerprint
+	// (and a matching User-Agent, see userAgent) rather than Chrome-on-iOS.
+	HelloID utls.ClientHelloID
 }
 
 // Dial opens a connection to addr and performs the auth handshake. The
@@ -95,7 +102,7 @@ func Dial(ctx context.Context, addr string, cfg ClientConfig) (net.Conn, error) 
 			RootCAs:    cfg.RootCAs,
 		}
 		uconn := utls.UClient(raw, tlsC, utls.HelloCustom)
-		spec, err := chromeNoECHSpec()
+		spec, err := helloSpec(clientHelloID(cfg))
 		if err != nil {
 			_ = raw.Close()
 			return nil, fmt.Errorf("build clienthello: %w", err)
@@ -137,12 +144,24 @@ func Dial(ctx context.Context, addr string, cfg ClientConfig) (net.Conn, error) 
 	return newWSConn(newBufferedConn(appConn, br), true, true), nil
 }
 
-// chromeNoECHSpec returns a current uTLS Chrome ClientHello spec with the
+// clientHelloID returns the uTLS fingerprint to mimic: the caller-selected
+// HelloID, or the default (current Chrome) when unset. Kept in one place so
+// the ClientHello spec and the User-Agent header stay consistent.
+func clientHelloID(cfg ClientConfig) utls.ClientHelloID {
+	if cfg.HelloID.Client != "" {
+		return cfg.HelloID
+	}
+	return utls.HelloChrome_Auto
+}
+
+// helloSpec builds a uTLS ClientHello spec for the given fingerprint with the
 // GREASE encrypted_client_hello (ECH) extension removed. Some networks and
 // middleboxes mishandle the ECH extension; removing it improves connectivity,
 // and bidichan always sends a cleartext SNI so the extension is unnecessary.
-func chromeNoECHSpec() (utls.ClientHelloSpec, error) {
-	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+// Stripping the GREASE-ECH extension is harmless for fingerprints that don't
+// carry one (iOS/Safari), so this is safe across HelloIDs.
+func helloSpec(id utls.ClientHelloID) (utls.ClientHelloSpec, error) {
+	spec, err := utls.UTLSIdToSpec(id)
 	if err != nil {
 		return utls.ClientHelloSpec{}, err
 	}
@@ -155,6 +174,28 @@ func chromeNoECHSpec() (utls.ClientHelloSpec, error) {
 	}
 	spec.Extensions = kept
 	return spec, nil
+}
+
+// chromeNoECHSpec is the default fingerprint: current Chrome, ECH stripped.
+func chromeNoECHSpec() (utls.ClientHelloSpec, error) {
+	return helloSpec(utls.HelloChrome_Auto)
+}
+
+// userAgent returns an HTTP User-Agent consistent with the TLS fingerprint id.
+// A Chrome JA3 paired with a Chrome UA is coherent; an iOS/Safari JA3 must not
+// ship a Chrome-on-Windows UA, which would itself be a fingerprinting tell.
+func userAgent(id utls.ClientHelloID) string {
+	switch id.Client {
+	case "iOS":
+		return "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) " +
+			"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+	case "Safari":
+		return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
+			"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
+	default:
+		return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+			"(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+	}
 }
 
 func performClientAuth(appConn net.Conn, cfg ClientConfig, binding []byte) (*bufio.Reader, error) {
@@ -182,7 +223,7 @@ func performClientAuth(appConn net.Conn, cfg ClientConfig, binding []byte) (*buf
 		"Upgrade: websocket\r\n" +
 		"Sec-WebSocket-Version: 13\r\n" +
 		"Sec-WebSocket-Key: " + wsKey + "\r\n" +
-		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36\r\n" +
+		"User-Agent: " + userAgent(clientHelloID(cfg)) + "\r\n" +
 		"Accept: */*\r\n" +
 		"Cookie: " + cookie + "\r\n" +
 		"\r\n"

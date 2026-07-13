@@ -8,15 +8,24 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os/exec"
 	"regexp"
-	"runtime"
 	"strconv"
 	"sync"
 
-	"github.com/songgao/water"
 	"github.com/torkve/bidichan/internal/peer"
 )
+
+// TUNDevice is the L3 packet device the TUN channel pumps against. It reads and
+// writes whole IP packets (one packet per Read/Write, matching songgao/water's
+// semantics). On Linux/macOS the concrete type is *water.Interface; on iOS it
+// is a caller-injected device backed by NEPacketTunnelFlow, registered via
+// SetTUNDeviceFactory from the mobile package. It is exported so that (in-module)
+// package can supply an implementation across the package boundary.
+// newTUNDevice is provided per-platform by build tag.
+type TUNDevice interface {
+	io.ReadWriteCloser
+	Name() string
+}
 
 // maxTUNFrame caps how many bytes we'll accept on a single inbound packet
 // frame. A compromised or buggy peer cannot force us to allocate more than
@@ -115,7 +124,7 @@ func (h *TUNHandler) HandleStream(ctx context.Context, p *peer.Peer, runner peer
 
 type tunRunner struct {
 	spec    peer.TUNSpec
-	ifce    *water.Interface
+	ifce    TUNDevice
 	stream  net.Conn
 	mu      sync.Mutex
 	closed  chan struct{}
@@ -168,12 +177,9 @@ func setupTUN(ctx context.Context, p *peer.Peer, chID uint64, specRaw json.RawMe
 	}
 	// Both sides create a TUN device. TUNSide indicates which side is the
 	// "primary" for naming/CIDR purposes; the opposite side mirrors with a
-	// best-effort default device name.
-	cfg := water.Config{DeviceType: water.TUN}
-	if runtime.GOOS == "linux" && spec.Name != "" {
-		applyLinuxName(&cfg, spec.Name)
-	}
-	ifce, err := water.New(cfg)
+	// best-effort default device name. newTUNDevice is platform-specific:
+	// water on Linux/macOS, the injected NEPacketTunnelFlow device on iOS.
+	ifce, err := newTUNDevice(spec)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create tun: %w", err)
 	}
@@ -301,23 +307,3 @@ func (r *tunRunner) attachStream(s net.Conn) error {
 	return nil
 }
 
-// configureInterface assigns an IP/CIDR and brings up the device using `ip`
-// on Linux. On other OSes this is a no-op and the operator must configure
-// the device out of band.
-func configureInterface(dev, cidr string, mtu int) error {
-	if runtime.GOOS != "linux" {
-		return nil
-	}
-	cmds := [][]string{
-		{"ip", "link", "set", "dev", dev, "mtu", fmt.Sprintf("%d", mtu)},
-		{"ip", "addr", "add", cidr, "dev", dev},
-		{"ip", "link", "set", "dev", dev, "up"},
-	}
-	for _, c := range cmds {
-		out, err := exec.Command(c[0], c[1:]...).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("%v: %w: %s", c, err, string(out))
-		}
-	}
-	return nil
-}
