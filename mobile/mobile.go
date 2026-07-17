@@ -12,8 +12,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"runtime/debug"
 	"strings"
@@ -32,11 +30,20 @@ type Client struct {
 	d      *daemon.Daemon
 	cancel context.CancelFunc
 	done   chan struct{}
-	runErr error // set once under mu before done is closed
+	runErr error  // set once under mu before done is closed
+	logger Logger // optional diagnostic sink; set via SetLogger before Start
 }
 
 // NewClient returns an idle client. Call Start to connect.
 func NewClient() *Client { return &Client{} }
+
+// SetLogger installs a diagnostic log sink. Call it before Start; passing nil
+// discards logs (the default).
+func (c *Client) SetLogger(l Logger) {
+	c.mu.Lock()
+	c.logger = l
+	c.mu.Unlock()
+}
 
 // Start dials the server described by cfg and blocks until the peer link is up
 // (or the attempt fails). flow, when non-nil, backs any tun channel opened over
@@ -92,7 +99,7 @@ func (c *Client) Start(cfg *Config, flow PacketFlow) error {
 		RootCAs:      pool,
 		HelloID:      fp,
 		EmbedControl: true,
-		Logger:       log.New(io.Discard, "", 0),
+		Logger:       newStdLogger(c.logger),
 		OnReady:      func() { readyOnce.Do(func() { close(ready) }) },
 	})
 	if err != nil {
