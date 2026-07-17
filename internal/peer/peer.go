@@ -565,6 +565,7 @@ type ChannelSnapshot struct {
 	Originator  bool        `json:"originator"`
 	CreatedAt   time.Time   `json:"created_at"`
 	Description string      `json:"description"`
+	Label       string      `json:"label,omitempty"`
 }
 
 // Snapshot returns a point-in-time view of open channels.
@@ -582,10 +583,25 @@ func (p *Peer) Snapshot() []ChannelSnapshot {
 			Originator:  st.originator,
 			CreatedAt:   st.createdAt,
 			Description: desc,
+			Label:       specLabel(st.spec),
 		})
 		return true
 	})
 	return out
+}
+
+// specLabel pulls the optional user label out of a channel's stored spec JSON.
+// Every spec kind (forward/proxy/tun) carries a `label` field, so one shared
+// decode covers them all; a missing or malformed spec just yields "".
+func specLabel(spec json.RawMessage) string {
+	if len(spec) == 0 {
+		return ""
+	}
+	var s struct {
+		Label string `json:"label"`
+	}
+	_ = json.Unmarshal(spec, &s)
+	return s.Label
 }
 
 // controlStream is the framed JSON channel both peers share for open/close

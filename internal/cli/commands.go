@@ -500,13 +500,13 @@ func newStatusCmd() *cobra.Command {
 				}
 				fmt.Printf("\nChannels on peer %s:\n", p.ID)
 				ctw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-				fmt.Fprintln(ctw, "  ID\tKIND\tROLE\tDESCRIPTION")
+				fmt.Fprintln(ctw, "  ID\tKIND\tLABEL\tROLE\tDESCRIPTION")
 				for _, ch := range p.Channels {
 					role := "accepted"
 					if ch.Originator {
 						role = "originated"
 					}
-					fmt.Fprintf(ctw, "  %d\t%s\t%s\t%s\n", ch.ID, ch.Kind, role, ch.Description)
+					fmt.Fprintf(ctw, "  %d\t%s\t%s\t%s\t%s\n", ch.ID, ch.Kind, ch.Label, role, ch.Description)
 				}
 				ctw.Flush()
 			}
