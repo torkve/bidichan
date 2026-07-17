@@ -140,6 +140,7 @@ type AutoChannel struct {
 	TargetAddr string // forward
 	Name       string // tun
 	CIDR       string // tun
+	CIDR6      string // tun (optional IPv6)
 	MTU        int    // tun
 	Label      string
 }
@@ -355,7 +356,7 @@ func (d *Daemon) openAutoChannel(ctx context.Context, p *peer.Peer, ch AutoChann
 		})
 	case "tun":
 		return p.OpenChannel(octx, peer.KindTUN, peer.TUNSpec{
-			TUNSide: side, Name: ch.Name, CIDR: ch.CIDR, MTU: ch.MTU, Label: ch.Label,
+			TUNSide: side, Name: ch.Name, CIDR: ch.CIDR, CIDR6: ch.CIDR6, MTU: ch.MTU, Label: ch.Label,
 		})
 	default:
 		return 0, fmt.Errorf("unknown channel kind %q", ch.Kind)

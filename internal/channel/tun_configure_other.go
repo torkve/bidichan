@@ -6,6 +6,6 @@ package channel
 // device out of band; on iOS addressing is applied by the Packet Tunnel
 // Provider via NEPacketTunnelNetworkSettings from the same TUNSpec CIDR/MTU, so
 // there is nothing to do in-process here.
-func configureInterface(dev, cidr string, mtu int) error {
+func configureInterface(dev, cidr, cidr6 string, mtu int) error {
 	return nil
 }

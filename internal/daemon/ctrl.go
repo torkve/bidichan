@@ -80,6 +80,7 @@ type OpenTUNArgs struct {
 	TUNSide string `json:"tun_side"` // "local" or "remote"
 	Name    string `json:"name,omitempty"`
 	CIDR    string `json:"cidr,omitempty"`
+	CIDR6   string `json:"cidr6,omitempty"`
 	MTU     int    `json:"mtu,omitempty"`
 	Label   string `json:"label,omitempty"`
 }
@@ -386,6 +387,7 @@ func (d *Daemon) ctrlOpenTUN(args OpenTUNArgs) CtrlResponse {
 		TUNSide: side,
 		Name:    args.Name,
 		CIDR:    args.CIDR,
+		CIDR6:   args.CIDR6,
 		MTU:     args.MTU,
 		Label:   args.Label,
 	}

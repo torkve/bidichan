@@ -7,15 +7,20 @@ import (
 	"os/exec"
 )
 
-// configureInterface assigns an IP/CIDR, sets the MTU, and brings the device up
-// using `ip` on Linux. dev and cidr have already been validated by
-// sanitizeTUNSpec before reaching here.
-func configureInterface(dev, cidr string, mtu int) error {
+// configureInterface assigns the IPv4 and/or IPv6 address, sets the MTU, and
+// brings the device up using `ip` on Linux. cidr/cidr6 have already been
+// validated by sanitizeTUNSpec; either may be empty.
+func configureInterface(dev, cidr, cidr6 string, mtu int) error {
 	cmds := [][]string{
 		{"ip", "link", "set", "dev", dev, "mtu", fmt.Sprintf("%d", mtu)},
-		{"ip", "addr", "add", cidr, "dev", dev},
-		{"ip", "link", "set", "dev", dev, "up"},
 	}
+	if cidr != "" {
+		cmds = append(cmds, []string{"ip", "addr", "add", cidr, "dev", dev})
+	}
+	if cidr6 != "" {
+		cmds = append(cmds, []string{"ip", "-6", "addr", "add", cidr6, "dev", dev})
+	}
+	cmds = append(cmds, []string{"ip", "link", "set", "dev", dev, "up"})
 	for _, c := range cmds {
 		out, err := exec.Command(c[0], c[1:]...).CombinedOutput()
 		if err != nil {

@@ -760,6 +760,7 @@ func newChannelOpenTUNCmd() *cobra.Command {
 				TUNSide: ac.Side,
 				Name:    ac.Name,
 				CIDR:    ac.CIDR,
+				CIDR6:   ac.CIDR6,
 				MTU:     ac.MTU,
 				Label:   ac.Label,
 			})
@@ -836,20 +837,21 @@ func (d *proxyDef) build(kind string) (daemon.AutoChannel, error) {
 }
 
 type tunDef struct {
-	side, name, cidr, label string
-	mtu                     int
+	side, name, cidr, cidr6, label string
+	mtu                            int
 }
 
 func (d *tunDef) register(f *pflag.FlagSet) {
 	f.StringVar(&d.side, "tun-side", "local", "local|remote — which side names the device")
 	f.StringVar(&d.name, "name", "", "device name (Linux only)")
-	f.StringVar(&d.cidr, "cidr", "", "IP/CIDR to assign (Linux only)")
+	f.StringVar(&d.cidr, "cidr", "", "IPv4 IP/CIDR to assign (Linux only)")
+	f.StringVar(&d.cidr6, "cidr6", "", "IPv6 IP/CIDR to assign (Linux only)")
 	f.IntVar(&d.mtu, "mtu", 1500, "MTU")
 	f.StringVar(&d.label, "label", "", "human label")
 }
 
 func (d *tunDef) build() (daemon.AutoChannel, error) {
-	return daemon.AutoChannel{Kind: "tun", Side: d.side, Name: d.name, CIDR: d.cidr, MTU: d.mtu, Label: d.label}, nil
+	return daemon.AutoChannel{Kind: "tun", Side: d.side, Name: d.name, CIDR: d.cidr, CIDR6: d.cidr6, MTU: d.mtu, Label: d.label}, nil
 }
 
 // parseAutoChannel parses a `channel open`-style spec string (e.g.

@@ -114,7 +114,8 @@ type ProxySpec struct {
 type TUNSpec struct {
 	TUNSide Side   `json:"tun_side"`
 	Name    string `json:"name,omitempty"`
-	CIDR    string `json:"cidr,omitempty"`
+	CIDR    string `json:"cidr,omitempty"`  // typically IPv4
+	CIDR6   string `json:"cidr6,omitempty"` // optional IPv6, for dual-stack
 	MTU     int    `json:"mtu,omitempty"`
 	Label   string `json:"label,omitempty"`
 }

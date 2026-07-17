@@ -95,6 +95,35 @@ func TestSanitizeTUNSpec(t *testing.T) {
 			ok:     false,
 			errSub: "unusable",
 		},
+		{
+			name: "valid dual-stack CIDR + CIDR6",
+			in:   peer.TUNSpec{CIDR: "10.42.0.1/24", CIDR6: "fd00:bd::1/64"},
+			ok:   true,
+		},
+		{
+			name:   "IPv4 in CIDR6 is rejected",
+			in:     peer.TUNSpec{CIDR6: "10.42.0.1/24"},
+			ok:     false,
+			errSub: "not an IPv6",
+		},
+		{
+			name:   "garbage CIDR6",
+			in:     peer.TUNSpec{CIDR6: "not a cidr; echo pwned"},
+			ok:     false,
+			errSub: "invalid CIDR6",
+		},
+		{
+			name:   "unspecified CIDR6 address",
+			in:     peer.TUNSpec{CIDR6: "::/64"},
+			ok:     false,
+			errSub: "unusable",
+		},
+		{
+			name:   "multicast CIDR6 address",
+			in:     peer.TUNSpec{CIDR6: "ff02::1/64"},
+			ok:     false,
+			errSub: "unusable",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -70,6 +70,20 @@ func sanitizeTUNSpec(s peer.TUNSpec) (peer.TUNSpec, error) {
 		}
 		out.CIDR = ip.String() + "/" + strconv.Itoa(ones)
 	}
+	if s.CIDR6 != "" {
+		ip, ipnet, err := net.ParseCIDR(s.CIDR6)
+		if err != nil {
+			return out, fmt.Errorf("invalid CIDR6 %q: %w", s.CIDR6, err)
+		}
+		if ip.To4() != nil {
+			return out, fmt.Errorf("CIDR6 %q is not an IPv6 address", s.CIDR6)
+		}
+		if ip.IsUnspecified() || ip.IsMulticast() {
+			return out, fmt.Errorf("CIDR6 %q has unusable address", s.CIDR6)
+		}
+		ones, _ := ipnet.Mask.Size()
+		out.CIDR6 = ip.String() + "/" + strconv.Itoa(ones)
+	}
 	if s.MTU != 0 && (s.MTU < minTUNMTU || s.MTU > maxTUNMTU) {
 		return out, fmt.Errorf("MTU %d outside [%d, %d]", s.MTU, minTUNMTU, maxTUNMTU)
 	}
@@ -189,8 +203,8 @@ func setupTUN(ctx context.Context, p *peer.Peer, chID uint64, specRaw json.RawMe
 		closed: make(chan struct{}),
 	}
 
-	if spec.CIDR != "" {
-		if err := configureInterface(ifce.Name(), spec.CIDR, r.effMTU()); err != nil {
+	if spec.CIDR != "" || spec.CIDR6 != "" {
+		if err := configureInterface(ifce.Name(), spec.CIDR, spec.CIDR6, r.effMTU()); err != nil {
 			_ = ifce.Close()
 			return nil, nil, fmt.Errorf("configure tun %s: %w", ifce.Name(), err)
 		}
