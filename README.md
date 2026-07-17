@@ -301,6 +301,44 @@ sudo bidichan channel open tun --tun-side local --cidr 10.42.0.2/24 --name bc0
 You then add routes (`ip route add ... dev bc0`) as you'd configure any
 point-to-point link.
 
+#### Full-tunnel gateway
+
+To send *all* of one peer's traffic out through the other (the "gateway"), the
+gateway must forward and NAT the tun subnet — bidichan creates the tun device
+but never touches forwarding or firewall rules, exactly like any router. Give
+the two ends **different** addresses in the subnet (e.g. client `10.42.0.2/24`,
+gateway `10.42.0.1/24`); if they share one address the gateway delivers return
+traffic to itself instead of routing it back over the tun.
+
+On the gateway (examples use the tun subnet `10.42.0.0/24` and WAN interface
+`eth0` — substitute your own):
+
+```sh
+# 1. Enable forwarding (persist under /etc/sysctl.d/).
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo sysctl -w net.ipv6.conf.all.forwarding=1   # only if you also tunnel IPv6
+
+# 2. Masquerade the tun subnet out the WAN interface. nftables:
+sudo nft add table ip nat
+sudo nft 'add chain ip nat postrouting { type nat hook postrouting priority srcnat ; }'
+sudo nft add rule ip nat postrouting ip saddr 10.42.0.0/24 oifname "eth0" masquerade
+# ...or iptables:
+sudo iptables -t nat -A POSTROUTING -s 10.42.0.0/24 -o eth0 -j MASQUERADE
+```
+
+For an IPv6 full tunnel, give the tun a ULA (gateway `fd00:bd::1/64`, client
+`fd00:bd::2/64`) and masquerade it as well:
+
+```sh
+sudo nft add table ip6 nat
+sudo nft 'add chain ip6 nat postrouting { type nat hook postrouting priority srcnat ; }'
+sudo nft add rule ip6 nat postrouting ip6 saddr fd00:bd::/64 oifname "eth0" masquerade
+```
+
+The client side needs a default route into the tun and must keep the bidichan
+connection itself off the tunnel (exclude the server's address, or the transport
+loops); the iOS client does both automatically.
+
 ### Interactive shell
 
 Open an interactive, PTY-backed shell on the **other** peer and attach your
