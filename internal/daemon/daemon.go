@@ -29,10 +29,15 @@ type Daemon struct {
 
 	mu    sync.RWMutex
 	peers map[string]*peer.Peer
+	// closing is set by Close, under mu, before it waits. It is what orders
+	// the last wg.Add against wg.Wait — see trackAdoption.
+	closing bool
 
 	ctrlLis net.Listener
 	ctrlDir string
 
+	// wg counts in-flight peer adoptions so Close can wait for them. Every
+	// Add goes through trackAdoption; adding directly would race Wait.
 	wg sync.WaitGroup
 
 	// cancelMu protects cancel from a race between Run (which writes it
@@ -248,7 +253,11 @@ func (d *Daemon) runListen(ctx context.Context) error {
 			}
 			return err
 		}
-		d.wg.Add(1)
+		if !d.trackAdoption() {
+			// Shutdown began while this connection was being authenticated.
+			_ = c.Close()
+			return nil
+		}
 		go func() {
 			defer d.wg.Done()
 			if _, err := d.adoptPeer(ctx, c, peer.RoleServer); err != nil {
@@ -326,6 +335,24 @@ func (d *Daemon) runConnect(ctx context.Context) error {
 	}
 }
 
+// trackAdoption registers an in-flight peer adoption, reporting false once
+// shutdown has begun so the caller drops the connection instead.
+//
+// The counter must be incremented under the same lock Close takes before it
+// waits. sync.WaitGroup requires that an Add which raises the counter from zero
+// happens before Wait, and here the counter is routinely zero: a listening
+// daemon sits idle between connections, so a peer arriving exactly as Close
+// runs is the ordinary case rather than a corner one.
+func (d *Daemon) trackAdoption() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closing {
+		return false
+	}
+	d.wg.Add(1)
+	return true
+}
+
 func (d *Daemon) adoptPeer(ctx context.Context, conn net.Conn, role peer.Role) (*peer.Peer, error) {
 	id, _ := randomID()
 	p, err := peer.NewPeer(role, conn, id, d.logger)
@@ -338,6 +365,15 @@ func (d *Daemon) adoptPeer(ctx context.Context, conn net.Conn, role peer.Role) (
 		return nil, err
 	}
 	d.mu.Lock()
+	if d.closing {
+		// Close drained the peer map while this peer was still completing its
+		// handshake, so it would never be torn down by anything. Registering
+		// it now would strand it: neither loop in peer.Peer watches ctx, so
+		// nothing else would ever shut it, its session or its goroutines down.
+		d.mu.Unlock()
+		_ = p.Close()
+		return nil, errors.New("daemon is shutting down")
+	}
 	d.peers[id] = p
 	d.mu.Unlock()
 	d.logger.Printf("peer %s up (remote=%s local=%s role=%v)", id, p.RemoteAddr(), p.LocalAddr(), role)
@@ -408,7 +444,10 @@ func (d *Daemon) Close() error {
 	if d.ctrlLis != nil {
 		_ = d.ctrlLis.Close()
 	}
+	// Closing under mu both tears the peers down and shuts the door on any
+	// further adoption, so the Wait below cannot race a late Add.
 	d.mu.Lock()
+	d.closing = true
 	for _, p := range d.peers {
 		_ = p.Close()
 	}
