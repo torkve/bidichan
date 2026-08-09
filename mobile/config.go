@@ -35,6 +35,12 @@ type Config struct {
 	// the runtime stays under the Network Extension's memory cap. 0 leaves it
 	// unset.
 	MemoryLimitMB int
+	// ResumeGraceSeconds is how long the connection may be gone before the
+	// session is given up and rebuilt. Inside that window the tunnel stalls and
+	// then resumes with its channels — and the connections running through
+	// them — intact; past it everything above the transport is rebuilt from
+	// scratch. 0 uses the transport default (90s).
+	ResumeGraceSeconds int
 }
 
 // NewConfig returns a Config with iOS-appropriate defaults.

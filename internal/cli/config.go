@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/pflag"
 )
@@ -32,6 +33,8 @@ type profileValues struct {
 	CACert       *string
 	Channels     []string // repeatable: one entry per `channel =` line
 	AllowShell   *bool
+	NoResume     *bool
+	ResumeGrace  *string
 }
 
 // loadProfile resolves a profile source — either an explicit path passed
@@ -226,8 +229,19 @@ func applyKey(out *profileValues, key, val string) error {
 			return fmt.Errorf("allow-shell: %w", err)
 		}
 		out.AllowShell = &b
+	case "no-resume":
+		b, err := parseBool(val)
+		if err != nil {
+			return fmt.Errorf("no-resume: %w", err)
+		}
+		out.NoResume = &b
+	case "resume-grace":
+		if _, err := time.ParseDuration(val); err != nil {
+			return fmt.Errorf("resume-grace: %w", err)
+		}
+		out.ResumeGrace = strPtr(val)
 	default:
-		return fmt.Errorf("unknown key %q (known keys: addr, unix-socket, hostname, psk, psk-file, no-tls-binding, cert, key, socket, decoy-backend, path, cacert, channel, allow-shell)", key)
+		return fmt.Errorf("unknown key %q (known keys: addr, unix-socket, hostname, psk, psk-file, no-tls-binding, cert, key, socket, decoy-backend, path, cacert, channel, allow-shell, no-resume, resume-grace)", key)
 	}
 	return nil
 }
@@ -361,6 +375,16 @@ func applyProfile(fs *pflag.FlagSet, source string, logger *log.Logger) (string,
 		} else {
 			set("allow-shell", "false")
 		}
+	}
+	if v.NoResume != nil {
+		if *v.NoResume {
+			set("no-resume", "true")
+		} else {
+			set("no-resume", "false")
+		}
+	}
+	if v.ResumeGrace != nil {
+		set("resume-grace", *v.ResumeGrace)
 	}
 	return path, nil
 }

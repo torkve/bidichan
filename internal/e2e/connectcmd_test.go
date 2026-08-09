@@ -165,8 +165,12 @@ func TestConnectOnPeerDown(t *testing.T) {
 	cli, err := daemon.New(daemon.Config{
 		Mode: daemon.ModeConnect, RemoteAddr: bindAddr, Hostname: "example.test",
 		PSK: psk, CACert: certPath, ControlSocket: cliSock, Logger: logger,
-		OnReady:    func() { close(ready) },
-		OnPeerDown: func() { close(down) },
+		// The transport now rides out an outage instead of failing with it, so
+		// the peer only goes down once the grace period is exhausted. Keep the
+		// grace short here so the test still covers that whole path.
+		ResumeGrace: 1500 * time.Millisecond,
+		OnReady:     func() { close(ready) },
+		OnPeerDown:  func() { close(down) },
 	})
 	if err != nil {
 		t.Fatal(err)

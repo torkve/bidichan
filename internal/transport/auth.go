@@ -104,6 +104,13 @@ func freshWSKey() (string, error) {
 // reply MAC (or vice versa). channel_binding is the SPKI binding for the
 // current TLS session (or empty in plain mode) — both peers compute the same
 // bytes.
+//
+// This covers the handshake and nothing else, deliberately: any peer, of any
+// version, computes the same value from the same inputs. Optional extensions
+// such as session resumption authenticate themselves separately (see
+// computeResumeMAC) rather than being folded in here, because a peer that does
+// not know about an extension would compute a different MAC and the handshake
+// would fail instead of degrading.
 func computeAuthMAC(psk []byte, role string, nonce []byte, timestamp int64, binding []byte) []byte {
 	mac := hmac.New(sha256.New, psk)
 	mac.Write([]byte(role))
@@ -115,6 +122,34 @@ func computeAuthMAC(psk []byte, role string, nonce []byte, timestamp int64, bind
 	mac.Write(tsStr)
 	mac.Write([]byte{0})
 	mac.Write(binding)
+	return mac.Sum(nil)
+}
+
+// computeResumeMAC authenticates a session-resumption payload against the
+// handshake carrying it. It is a separate MAC, in its own cookie, so that a
+// peer which does not implement resumption simply ignores an unknown cookie and
+// still agrees on computeAuthMAC — old and new peers interoperate in both
+// directions.
+//
+// The payload has to be authenticated: a resume position forged in flight would
+// make one side skip retransmitting bytes the other still needs, silently
+// desynchronising the multiplexed stream. Binding it to the same nonce,
+// timestamp and channel binding as the handshake keeps it from being lifted
+// onto a different connection.
+func computeResumeMAC(psk []byte, role string, nonce []byte, timestamp int64, binding, payload []byte) []byte {
+	mac := hmac.New(sha256.New, psk)
+	mac.Write([]byte("bidichan/resume/v1"))
+	mac.Write([]byte{0})
+	mac.Write([]byte(role))
+	mac.Write([]byte{0})
+	mac.Write(nonce)
+	mac.Write([]byte{0})
+	var tsBuf [20]byte
+	mac.Write(strconv.AppendInt(tsBuf[:0], timestamp, 10))
+	mac.Write([]byte{0})
+	mac.Write(binding)
+	mac.Write([]byte{0})
+	mac.Write(payload)
 	return mac.Sum(nil)
 }
 

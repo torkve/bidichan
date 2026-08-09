@@ -48,6 +48,15 @@ type ServerConfig struct {
 	// derives a PSK-specific path (the default); set it to pin a fixed path
 	// that matches a reverse-proxy location.
 	Path string
+
+	// DisableResume refuses session resumption even when the client offers
+	// it, so every connection dies with its network as it did before.
+	DisableResume bool
+
+	// ResumeConfig tunes the sessions this listener holds open for resuming
+	// clients — chiefly Grace, the window in which a client that lost the
+	// network may come back and pick up its channels.
+	ResumeConfig ResumeConfig
 }
 
 // plainMode is true when the listener does not terminate TLS itself.
@@ -74,6 +83,11 @@ type Listener struct {
 	closed bool
 
 	seenNonces *nonceCache
+
+	// sessions holds the resumable sessions this endpoint is carrying, so a
+	// client that lost its network can reattach to the one it left behind
+	// instead of building a new peer.
+	sessions *sessionRegistry
 }
 
 // Listen sets up the listener. PSK and Hostname must be non-empty.
@@ -98,7 +112,10 @@ func Listen(ctx context.Context, addr string, cfg ServerConfig) (*Listener, erro
 	l := &Listener{
 		cfg:        cfg,
 		seenNonces: newNonceCache(),
+		sessions:   newSessionRegistry(),
 	}
+	l.cfg.ResumeConfig = cfg.ResumeConfig.withDefaults()
+	l.cfg.ResumeConfig.Logger = cfg.Logger
 	l.path = cfg.Path
 	if l.path == "" {
 		l.path = derivePath(cfg.PSK)
@@ -180,6 +197,7 @@ func (l *Listener) Close() error {
 		return nil
 	}
 	l.closed = true
+	l.sessions.closeAll()
 	return l.inner.Close()
 }
 
@@ -261,12 +279,58 @@ func (l *Listener) handle(raw net.Conn, out chan<- net.Conn) {
 		return
 	}
 
+	// The resume cookie carries its own MAC over the same handshake, so it can
+	// only be read once the nonce and timestamp are known. A cookie that fails
+	// it was rewritten in flight — treat that like any other bad handshake
+	// rather than quietly serving the client without resumption, which is what
+	// an attacker corrupting one cookie would be aiming for.
+	resumeReq, err := resumeRequestFrom(req, l.cfg.PSK, nonce, ts, binding)
+	if err != nil {
+		l.cfg.Logger.Printf("transport: rejecting %s: resume %v", raw.RemoteAddr(), err)
+		l.serveDecoy(appConn, br, req)
+		return
+	}
+
 	if req.Body != nil {
 		_, _ = io.Copy(io.Discard, io.LimitReader(req.Body, 1<<14))
 		_ = req.Body.Close()
 	}
 
-	if err := l.replySwitchingProtocols(appConn, req, binding, nonce, ts); err != nil {
+	// Decide what happens to this connection before answering, because the
+	// answer carries the verdict (and our own replay position).
+	var (
+		reply    *resumeReply
+		existing *Session
+	)
+	if resumeReq != nil && !l.cfg.DisableResume {
+		existing = l.sessions.get(resumeReq.ID)
+		switch {
+		case existing != nil:
+			// Detaching and reading the position must happen together, before
+			// the number goes out in the reply — see Session.prepareResume.
+			recv, err := existing.prepareResume()
+			if err != nil {
+				// It died between the lookup and here.
+				existing = nil
+				reply = &resumeReply{Status: resumeGone}
+				break
+			}
+			reply = &resumeReply{Status: resumeResumed, RecvSeq: recv}
+		case resumeReq.RecvSeq > 0:
+			// The client is continuing a session we no longer hold — it
+			// expired, or we restarted. Say so plainly; it will rebuild.
+			reply = &resumeReply{Status: resumeGone}
+		case l.sessions.full():
+			// At capacity. Leaving the answer out serves this client the way
+			// an older one is served: a connection that dies with its network.
+			l.cfg.Logger.Printf("transport: session table full (%d); serving %s without resumption",
+				maxLiveSessions, raw.RemoteAddr())
+		default:
+			reply = &resumeReply{Status: resumeNew}
+		}
+	}
+
+	if err := l.replySwitchingProtocols(appConn, req, binding, nonce, ts, resumeReq, reply); err != nil {
 		l.cfg.Logger.Printf("transport: write 101 failed: %v", err)
 		_ = appConn.Close()
 		return
@@ -276,7 +340,32 @@ func (l *Listener) handle(raw net.Conn, out chan<- net.Conn) {
 
 	// Wrap the data phase in real RFC 6455 framing (server does not mask) so
 	// the post-101 bytes are valid WebSocket frames, not raw yamux.
-	conn := newWSConn(newBufferedConn(appConn, br), false, true)
+	var conn net.Conn = newWSConn(newBufferedConn(appConn, br), false, true)
+
+	switch {
+	case reply == nil:
+		// No resumption: hand the raw connection up, as before.
+	case reply.Status == resumeGone:
+		l.cfg.Logger.Printf("transport: session %s is gone; client must rebuild", resumeReq.ID)
+		_ = conn.Close()
+		return
+	case reply.Status == resumeResumed:
+		if err := existing.Attach(conn, resumeReq.RecvSeq); err != nil {
+			l.cfg.Logger.Printf("transport: session %s attach failed: %v", resumeReq.ID, err)
+			_ = conn.Close()
+			return
+		}
+		l.cfg.Logger.Printf("transport: session %s resumed from %s", resumeReq.ID, raw.RemoteAddr())
+		// The peer that owns this session is already running; there is
+		// nothing to hand to Accept.
+		return
+	default:
+		sess := newSession(resumeReq.ID, conn, l.cfg.ResumeConfig, l.sessions.remove)
+		l.sessions.add(sess)
+		l.cfg.Logger.Printf("transport: session %s established from %s", resumeReq.ID, raw.RemoteAddr())
+		conn = sess
+	}
+
 	select {
 	case out <- conn:
 	default:
@@ -311,7 +400,20 @@ func (l *Listener) verifyClientAuth(req *http.Request, binding []byte) ([]byte, 
 	return nonce, ts, nil
 }
 
-func (l *Listener) replySwitchingProtocols(c net.Conn, req *http.Request, binding, nonce []byte, ts int64) error {
+// replySwitchingProtocols writes the 101, carrying our proof of the PSK and —
+// when resumption was negotiated — the verdict on the client's resume request.
+// The verdict is inside the MAC so it cannot be rewritten in flight.
+func (l *Listener) replySwitchingProtocols(c net.Conn, req *http.Request, binding, nonce []byte, ts int64,
+	resume *resumeRequest, reply *resumeReply) error {
+	resumeCookie := ""
+	if reply != nil {
+		var requestRaw []byte
+		if resume != nil {
+			requestRaw = resume.bytes()
+		}
+		resumeCookie = "Set-Cookie: " + resumeAckCookieName(l.cfg.PSK) + "=" +
+			reply.encode(l.cfg.PSK, nonce, ts, binding, requestRaw) + "; Path=/; HttpOnly\r\n"
+	}
 	serverMAC := computeAuthMAC(l.cfg.PSK, "server", nonce, ts, binding)
 	verifyCookie := verifyCookieName(l.cfg.PSK) + "=" + base64.RawURLEncoding.EncodeToString(serverMAC)
 	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
@@ -319,6 +421,7 @@ func (l *Listener) replySwitchingProtocols(c net.Conn, req *http.Request, bindin
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Accept: " + wsAccept(req.Header.Get("Sec-WebSocket-Key")) + "\r\n" +
 		"Set-Cookie: " + verifyCookie + "; Path=/; HttpOnly\r\n" +
+		resumeCookie +
 		"\r\n"
 	_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	_, err := io.WriteString(c, resp)

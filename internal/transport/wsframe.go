@@ -153,6 +153,18 @@ func (w *wsConn) readFrame() (opcode byte, payload []byte, err error) {
 // writeFrame emits one whole frame (FIN set) in a single Write so the header
 // and payload are not split into separate segments.
 func (w *wsConn) writeFrame(opcode byte, payload []byte) error {
+	frame, err := w.buildFrame(opcode, payload)
+	if err != nil {
+		return err
+	}
+	w.wmu.Lock()
+	defer w.wmu.Unlock()
+	_, err = w.inner.Write(frame)
+	return err
+}
+
+// buildFrame renders a complete frame, masking it when we are the client.
+func (w *wsConn) buildFrame(opcode byte, payload []byte) ([]byte, error) {
 	n := len(payload)
 	headerLen := 2
 	switch {
@@ -182,7 +194,7 @@ func (w *wsConn) writeFrame(opcode byte, payload []byte) error {
 		frame[1] |= 0x80 // MASK
 		var key [4]byte
 		if _, err := rand.Read(key[:]); err != nil {
-			return err
+			return nil, err
 		}
 		copy(frame[off:off+4], key[:])
 		off += 4
@@ -192,11 +204,7 @@ func (w *wsConn) writeFrame(opcode byte, payload []byte) error {
 	} else {
 		copy(frame[off:], payload)
 	}
-
-	w.wmu.Lock()
-	defer w.wmu.Unlock()
-	_, err := w.inner.Write(frame)
-	return err
+	return frame, nil
 }
 
 // coverLoop sends a small ping frame at randomised intervals to keep an idle
@@ -219,9 +227,20 @@ func (w *wsConn) coverLoop() {
 	}
 }
 
+// Close shuts the connection down. The RFC 6455 close frame is a courtesy and
+// is skipped whenever the write path is busy, because closing must never wait
+// on it: a resumable session replaces a link that has stopped working by
+// closing it, and that is what aborts whatever is stuck on the old socket. On
+// a path that has gone away without a reset — a phone leaving Wi-Fi — a write
+// sits there until its deadline expires, and queueing behind it would hold the
+// replacement link idle for exactly as long as resumption exists to avoid.
 func (w *wsConn) Close() error {
 	w.closeOnce.Do(func() { close(w.done) })
-	_ = w.writeFrame(wsOpClose, nil) // best effort
+	if frame, err := w.buildFrame(wsOpClose, nil); err == nil && w.wmu.TryLock() {
+		_ = w.inner.SetWriteDeadline(time.Now().Add(time.Second))
+		_, _ = w.inner.Write(frame)
+		w.wmu.Unlock()
+	}
 	return w.inner.Close()
 }
 

@@ -108,6 +108,8 @@ func newListenCmd() *cobra.Command {
 		decoyBackend string
 		wsPath       string
 		allowShell   bool
+		noResume     bool
+		resumeGrace  time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "listen [<profile>]",
@@ -177,6 +179,8 @@ or /etc/bidichan/<name>.conf.`,
 				DecoyBackend:     decoyBackend,
 				Path:             wsPath,
 				AllowShell:       allowShell,
+				DisableResume:    noResume,
+				ResumeGrace:      resumeGrace,
 				ControlSocket:    sock,
 				Logger:           logger,
 			})
@@ -198,6 +202,8 @@ or /etc/bidichan/<name>.conf.`,
 	f.StringVar(&decoyBackend, "decoy-backend", "", "proxy unauthenticated connections to this real web backend (host:port or unix:/path) instead of the built-in static page")
 	f.StringVar(&wsPath, "path", "", "WebSocket upgrade request path (default: derived from the PSK; logged at startup)")
 	f.BoolVar(&allowShell, "allow-shell", false, "allow the peer to open an interactive shell on this host (grants the peer RCE)")
+	f.BoolVar(&noResume, "no-resume", false, "do not hold a peer's session open for it to reconnect to; every connection dies with its network")
+	f.DurationVar(&resumeGrace, "resume-grace", 0, "how long to hold a session for a client that lost its network (default 90s)")
 	f.StringVar(&sock, "socket", "", "local CLI control socket path (default $XDG_RUNTIME_DIR/bidichan-<pid>.sock)")
 
 	_ = cmd.RegisterFlagCompletionFunc("config", profileFlagCompletion)
@@ -208,18 +214,20 @@ or /etc/bidichan/<name>.conf.`,
 
 func newConnectCmd() *cobra.Command {
 	var (
-		configSrc  string
-		addr       string
-		unixPath   string
-		hostname   string
-		pskHex     string
-		pskFile    string
-		noBind     bool
-		sock       string
-		wsPath     string
-		caCert     string
-		channels   []string
-		allowShell bool
+		configSrc   string
+		addr        string
+		unixPath    string
+		hostname    string
+		pskHex      string
+		pskFile     string
+		noBind      bool
+		sock        string
+		wsPath      string
+		caCert      string
+		channels    []string
+		allowShell  bool
+		noResume    bool
+		resumeGrace time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "connect [<profile>] [-- <command>...]",
@@ -318,6 +326,8 @@ command's status and tears the tunnel down.`,
 				CACert:           caCert,
 				AutoChannels:     autoChannels,
 				AllowShell:       allowShell,
+				DisableResume:    noResume,
+				ResumeGrace:      resumeGrace,
 				ControlSocket:    sock,
 				Logger:           logger,
 			}
@@ -348,6 +358,8 @@ command's status and tears the tunnel down.`,
 	f.StringVar(&caCert, "cacert", "", "PEM bundle to verify the server cert against (for self-signed / private CA); default: system trust store")
 	f.StringArrayVar(&channels, "channel", nil, "channel to open once connected, e.g. \"forward -L 8080:host:80\" (repeatable; same syntax as 'channel open')")
 	f.BoolVar(&allowShell, "allow-shell", false, "allow the peer to open an interactive shell on this host (grants the peer RCE)")
+	f.BoolVar(&noResume, "no-resume", false, "do not resume the session over a new connection when the network drops; the peer dies with it")
+	f.DurationVar(&resumeGrace, "resume-grace", 0, "how long the network may be gone before the session is given up (default 90s)")
 	f.StringVar(&sock, "socket", "", "local CLI control socket path")
 
 	_ = cmd.RegisterFlagCompletionFunc("config", profileFlagCompletion)

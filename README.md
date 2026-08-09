@@ -15,6 +15,12 @@ Channel kinds:
 | tun      | L3 TUN device with packets framed across one yamux stream     |
 | shell    | interactive PTY-backed shell on the peer (needs `--allow-shell`) |
 
+A connection survives its network. When the link drops — a flapping uplink, a
+laptop suspending, a phone moving from Wi-Fi to cellular — the session is
+resumed byte-exactly over a fresh connection, so open channels and the TCP
+connections running through them carry on where they left off instead of
+dying. See [Surviving a network outage](#surviving-a-network-outage).
+
 Any connection with the wrong SNI, the wrong PSK, or an ordinary HTTPS request
 is transparently proxied to a real web backend you configure (`--decoy-backend`),
 so it gets a genuine site — real 404s for unknown paths and all. Without a
@@ -367,6 +373,74 @@ bidichan status                 # find the channel ID
 bidichan channel close --id 1
 ```
 
+## Surviving a network outage
+
+Losing the network no longer ends a tunnel. Underneath the multiplexer sits a
+resumable session: each side counts the bytes it has sent and the bytes it has
+received, and keeps what the other end has not acknowledged. When the
+connection dies the session stalls rather than failing, the connect side
+redials, and the two ends replay from each other's counters. Above that layer
+nothing notices — the peer, its channels, and the TCP connections inside them
+are the same ones as before.
+
+```console
+# Watch it happen: the daemon logs the outage and the recovery.
+transport: session Yr3k… link down: read: connection reset (buffered 4312 B, grace 1m30s)
+transport: session Yr3k… resumed after 3 attempt(s)
+```
+
+What survives, and how completely:
+
+| channel        | during the outage                    | after resuming                       |
+| -------------- | ------------------------------------ | ------------------------------------ |
+| forward, http, socks5 | connections stall                    | continue, with no bytes lost         |
+| shell          | the session freezes                  | continues, scrollback intact         |
+| tun            | packets are dropped once buffers fill | continues; inner TCP retransmits     |
+
+The tun channel is the one exception to "no bytes lost", and deliberately so: a
+TUN device carries datagrams, so packets that pile up during a long outage are
+dropped exactly as they would be on a real link. The TCP connections *inside*
+the tunnel retransmit and recover on their own.
+
+### Tuning it
+
+The **grace period** is how long the network may be gone before the session is
+given up. Within it, everything above resumes; past it, the peer is lost and
+has to be rebuilt from scratch. It defaults to 90 seconds and is configured on
+both ends independently — the effective window is the shorter of the two.
+
+```console
+# Client: give up after five minutes instead of ninety seconds.
+bidichan connect --resume-grace 5m ...
+
+# Server: hold a client's session (and its channels) for the same window.
+bidichan listen --resume-grace 5m ...
+
+# Or turn resumption off entirely, on either end.
+bidichan connect --no-resume ...
+```
+
+Both are also config-file keys (`resume-grace`, `no-resume`).
+
+A longer window survives longer outages, at a cost on the **server**: it holds
+the session, its channels, their target connections, and up to a few MiB of
+unacknowledged data for the whole period, for every client that vanished. The
+default is a reasonable trade for a handful of peers.
+
+### What it costs, and what it does not change
+
+- Each side buffers unacknowledged data (4 MiB by default). A sender that fills
+  it blocks, which is ordinary backpressure — it reaches the applications inside
+  the tunnel as a stalled connection, not an error.
+- Resumption is negotiated in the WebSocket upgrade, in the same PSK-derived
+  cookie style as authentication, and each side's payload carries its own MAC.
+  The handshake MAC itself is untouched, so a peer that does not implement
+  resumption computes the same value and simply ignores an unknown cookie:
+  **old and new peers interoperate in both directions**, falling back to a
+  connection that dies with its network.
+- The wire still looks like the same HTTPS WebSocket service: one extra cookie
+  going out, one extra `Set-Cookie` coming back.
+
 ## Multiple peers
 
 If a daemon has more than one peer connected (e.g. a listening server with
@@ -652,9 +726,25 @@ Trade-offs to know about:
   transparently proxied to the real `--decoy-backend`, which returns its genuine
   responses (e.g. a real 404 for an unknown path). Without a backend configured,
   the built-in fallback is a static nginx page.
-- **Timing:** both the TCP keepalive and the yamux keepalive are jittered per
-  connection (≈20–40 s); the WebSocket layer also emits low-rate ping frames at
-  randomised intervals as lightweight keepalive traffic.
+- **Session resumption:** the client offers a session id and its receive
+  counter in a second PSK-named cookie; a server that supports it answers in a
+  `Set-Cookie` with its verdict (new / resumed / gone) and its own counter. Each
+  payload carries its own `HMAC-SHA256` over the same nonce, timestamp and
+  channel binding as the handshake (the server's also covers the request it
+  answers), so a resume position cannot be forged or replayed onto another
+  connection — a wrong counter would make one side skip bytes the other still
+  needs. The handshake MAC is deliberately *not* extended, so a peer that knows
+  nothing about resumption computes the same value and just ignores an unknown
+  cookie; the two generations interoperate in both directions. Inside the data
+  phase the byte stream is wrapped in a small frame header (type + 24-bit
+  length) carrying data, acknowledgements and keepalives. See
+  [Surviving a network outage](#surviving-a-network-outage).
+- **Timing:** the TCP keepalive is jittered per connection (≈20–40 s) and the
+  WebSocket layer emits low-rate ping frames at randomised intervals as
+  lightweight keepalive traffic. On a resumable session the resume layer pings
+  every ≈20 s and yamux's own keepalive is switched off — it would otherwise
+  tear the session down mid-outage, which is precisely what resumption exists
+  to prevent.
 
 ### Caveats
 

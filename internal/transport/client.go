@@ -56,23 +56,42 @@ type ClientConfig struct {
 	// HelloSafari_Auto so an iPhone presents a Safari-family fingerprint
 	// (and a matching User-Agent, see userAgent) rather than Chrome-on-iOS.
 	HelloID utls.ClientHelloID
+
+	// ResumeConfig tunes the resumable session DialSession builds — most
+	// importantly Grace, which is how long a network outage may last before
+	// the tunnel gives up. Ignored by Dial.
+	ResumeConfig ResumeConfig
+
+	// OnLinkState, when set, is called by DialSession's supervisor on every
+	// link transition, so a host can distinguish "reconnecting" from "gone".
+	OnLinkState func(state LinkState, err error)
 }
 
 // Dial opens a connection to addr and performs the auth handshake. The
-// returned net.Conn is ready for multiplex framing.
+// returned net.Conn is ready for multiplex framing. It never negotiates
+// session resumption — use DialSession for a link that survives the network
+// going away.
 func Dial(ctx context.Context, addr string, cfg ClientConfig) (net.Conn, error) {
+	c, _, err := dial(ctx, addr, cfg, nil)
+	return c, err
+}
+
+// dial performs one connection attempt. When resume is non-nil the handshake
+// offers session resumption and the server's answer is returned alongside the
+// connection; a nil answer means the server does not implement it.
+func dial(ctx context.Context, addr string, cfg ClientConfig, resume *resumeRequest) (net.Conn, *resumeReply, error) {
 	if len(cfg.PSK) == 0 {
-		return nil, errors.New("transport: empty PSK")
+		return nil, nil, errors.New("transport: empty PSK")
 	}
 	if cfg.Hostname == "" {
-		return nil, errors.New("transport: empty hostname")
+		return nil, nil, errors.New("transport: empty hostname")
 	}
 	network := cfg.Network
 	if network == "" {
 		network = "tcp"
 	}
 	if network != "tcp" && network != "unix" {
-		return nil, fmt.Errorf("transport: invalid network %q", network)
+		return nil, nil, fmt.Errorf("transport: invalid network %q", network)
 	}
 
 	d := net.Dialer{}
@@ -82,7 +101,7 @@ func Dial(ctx context.Context, addr string, cfg ClientConfig) (net.Conn, error) 
 	}
 	raw, err := d.DialContext(ctx, network, addr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var (
@@ -105,11 +124,11 @@ func Dial(ctx context.Context, addr string, cfg ClientConfig) (net.Conn, error) 
 		spec, err := helloSpec(clientHelloID(cfg))
 		if err != nil {
 			_ = raw.Close()
-			return nil, fmt.Errorf("build clienthello: %w", err)
+			return nil, nil, fmt.Errorf("build clienthello: %w", err)
 		}
 		if err := uconn.ApplyPreset(&spec); err != nil {
 			_ = raw.Close()
-			return nil, fmt.Errorf("apply clienthello: %w", err)
+			return nil, nil, fmt.Errorf("apply clienthello: %w", err)
 		}
 
 		if dl, ok := ctx.Deadline(); ok {
@@ -119,29 +138,29 @@ func Dial(ctx context.Context, addr string, cfg ClientConfig) (net.Conn, error) 
 		}
 		if err := uconn.HandshakeContext(ctx); err != nil {
 			_ = uconn.Close()
-			return nil, fmt.Errorf("tls handshake: %w", err)
+			return nil, nil, fmt.Errorf("tls handshake: %w", err)
 		}
 		appConn = uconn
 		if !cfg.SkipBinding {
 			cs := uconn.ConnectionState()
 			if len(cs.PeerCertificates) == 0 {
 				_ = uconn.Close()
-				return nil, errors.New("no server certificate for channel binding")
+				return nil, nil, errors.New("no server certificate for channel binding")
 			}
 			binding = spkiBinding(cs.PeerCertificates[0])
 		}
 	}
 
-	br, err := performClientAuth(appConn, cfg, binding)
+	br, reply, err := performClientAuth(appConn, cfg, binding, resume)
 	if err != nil {
 		_ = appConn.Close()
-		return nil, err
+		return nil, nil, err
 	}
 
 	_ = appConn.SetDeadline(time.Time{})
 	// Wrap the data phase in real RFC 6455 framing (client masks) so the
 	// post-101 bytes are valid WebSocket frames, not raw yamux.
-	return newWSConn(newBufferedConn(appConn, br), true, true), nil
+	return newWSConn(newBufferedConn(appConn, br), true, true), reply, nil
 }
 
 // clientHelloID returns the uTLS fingerprint to mimic: the caller-selected
@@ -198,17 +217,17 @@ func userAgent(id utls.ClientHelloID) string {
 	}
 }
 
-func performClientAuth(appConn net.Conn, cfg ClientConfig, binding []byte) (*bufio.Reader, error) {
+func performClientAuth(appConn net.Conn, cfg ClientConfig, binding []byte, resume *resumeRequest) (*bufio.Reader, *resumeReply, error) {
 	nonce, err := freshNonce()
 	if err != nil {
-		return nil, fmt.Errorf("nonce: %w", err)
+		return nil, nil, fmt.Errorf("nonce: %w", err)
 	}
 	ts := time.Now().Unix()
 	mac := computeAuthMAC(cfg.PSK, "client", nonce, ts, binding)
 
 	wsKey, err := freshWSKey()
 	if err != nil {
-		return nil, fmt.Errorf("ws key: %w", err)
+		return nil, nil, fmt.Errorf("ws key: %w", err)
 	}
 
 	path := cfg.Path
@@ -216,6 +235,14 @@ func performClientAuth(appConn net.Conn, cfg ClientConfig, binding []byte) (*buf
 		path = derivePath(cfg.PSK)
 	}
 	cookie := authCookieName(cfg.PSK) + "=" + encodeAuthPayload(nonce, ts, mac)
+	// The resume request travels in its own cookie with its own MAC, so a
+	// server that knows nothing about resumption ignores it and still agrees
+	// on the handshake MAC above.
+	var resumeRaw []byte
+	if resume != nil {
+		resumeRaw = resume.bytes()
+		cookie += "; " + resumeCookieName(cfg.PSK) + "=" + resume.encode(cfg.PSK, nonce, ts, binding)
+	}
 
 	req := "GET " + path + " HTTP/1.1\r\n" +
 		"Host: " + cfg.Hostname + "\r\n" +
@@ -228,13 +255,13 @@ func performClientAuth(appConn net.Conn, cfg ClientConfig, binding []byte) (*buf
 		"Cookie: " + cookie + "\r\n" +
 		"\r\n"
 	if _, err := io.WriteString(appConn, req); err != nil {
-		return nil, fmt.Errorf("write upgrade: %w", err)
+		return nil, nil, fmt.Errorf("write upgrade: %w", err)
 	}
 
 	br := bufio.NewReader(appConn)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return nil, fmt.Errorf("read upgrade response: %w", err)
+		return nil, nil, fmt.Errorf("read upgrade response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
@@ -242,23 +269,34 @@ func performClientAuth(appConn net.Conn, cfg ClientConfig, binding []byte) (*buf
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 			_ = resp.Body.Close()
 		}
-		return nil, fmt.Errorf("server rejected upgrade: status %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("server rejected upgrade: status %d", resp.StatusCode)
 	}
 
 	if resp.Header.Get("Sec-WebSocket-Accept") != wsAccept(wsKey) {
-		return nil, errors.New("bad Sec-WebSocket-Accept")
+		return nil, nil, errors.New("bad Sec-WebSocket-Accept")
 	}
 
 	serverMAC, err := cookieMAC(resp.Cookies(), verifyCookieName(cfg.PSK))
 	if err != nil {
-		return nil, fmt.Errorf("server verify cookie: %w", err)
+		return nil, nil, fmt.Errorf("server verify cookie: %w", err)
 	}
 	wantServerMAC := computeAuthMAC(cfg.PSK, "server", nonce, ts, binding)
 	if !hmac.Equal(serverMAC, wantServerMAC) {
-		return nil, errors.New("server MAC mismatch")
+		return nil, nil, errors.New("server MAC mismatch")
 	}
 
-	return br, nil
+	// A server that implements resumption answers with its own verdict, bound
+	// to the request we sent. An older one says nothing and we carry on without
+	// it; an answer that fails its MAC was rewritten in flight.
+	var reply *resumeReply
+	if resume != nil {
+		reply, err = resumeReplyFrom(resp.Cookies(), cfg.PSK, nonce, ts, binding, resumeRaw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("server resume answer: %w", err)
+		}
+	}
+
+	return br, reply, nil
 }
 
 // cookieMAC extracts and base64-decodes the MAC carried in the named cookie.

@@ -113,6 +113,15 @@ func jitter(base, spread time.Duration) time.Duration {
 	return base + delta
 }
 
+// resumableConn is implemented by a transport connection that survives losing
+// the network: reads and writes block for up to ResumeGrace while it redials
+// and replays, instead of returning an error. Detected by behaviour rather
+// than configured by the caller, so the two can never disagree.
+type resumableConn interface {
+	Resumable() bool
+	ResumeGrace() time.Duration
+}
+
 func NewPeer(role Role, conn net.Conn, id string, logger *log.Logger) (*Peer, error) {
 	if logger == nil {
 		logger = log.Default()
@@ -127,6 +136,18 @@ func NewPeer(role Role, conn net.Conn, id string, logger *log.Logger) (*Peer, er
 	yc.KeepAliveInterval = jitter(30*time.Second, 10*time.Second)
 	yc.ConnectionWriteTimeout = 30 * time.Second
 	yc.MaxStreamWindowSize = 1 << 20 // 1 MiB per stream
+
+	// A resumable transport deliberately stalls instead of failing while the
+	// network is away, and the connection itself reports how long it will do
+	// that for. yamux's own liveness must then stand well back: its keepalive
+	// would ping into the stall and kill the session after one write timeout,
+	// which is exactly the teardown the resumable transport exists to prevent.
+	// Liveness moves to the transport, which pings on its own link and gives
+	// up only when the grace period expires.
+	if r, ok := conn.(resumableConn); ok && r.Resumable() {
+		yc.EnableKeepAlive = false
+		yc.ConnectionWriteTimeout = r.ResumeGrace() + 30*time.Second
+	}
 
 	var (
 		sess *yamux.Session
@@ -180,6 +201,11 @@ func (p *Peer) RemoteAddr() string { return p.remote }
 
 // LocalAddr returns the local network address.
 func (p *Peer) LocalAddr() string { return p.local }
+
+// Conn returns the transport connection carrying this peer. A host that can
+// see network changes before the transport notices uses it to prod a resumable
+// connection into redialing immediately.
+func (p *Peer) Conn() net.Conn { return p.conn }
 
 // StartedAt returns when the peer was constructed.
 func (p *Peer) StartedAt() time.Time { return p.startedAt }

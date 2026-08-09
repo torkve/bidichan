@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"sync"
 	"testing"
+	"time"
 )
 
 // tcpPair returns two connected TCP conns over loopback.
@@ -150,5 +152,72 @@ func TestWSPingAnswered(t *testing.T) {
 	opcode, _, payload := readRawFrame(t, c1)
 	if opcode != wsOpPong || string(payload) != "hi" {
 		t.Fatalf("got opcode=0x%x payload=%q, want pong/\"hi\"", opcode, payload)
+	}
+}
+
+// wedgedConn stands in for a socket on a path that has silently gone away:
+// writes park forever, and only closing the connection releases them. That is
+// the state a phone's old Wi-Fi socket is in the moment it moves to cellular —
+// no reset arrives, so the write sits there until a deadline fires.
+type wedgedConn struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newWedgedConn() *wedgedConn { return &wedgedConn{closed: make(chan struct{})} }
+
+func (c *wedgedConn) Write(p []byte) (int, error) {
+	<-c.closed
+	return 0, net.ErrClosed
+}
+
+func (c *wedgedConn) Read(p []byte) (int, error) {
+	<-c.closed
+	return 0, net.ErrClosed
+}
+
+func (c *wedgedConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *wedgedConn) LocalAddr() net.Addr              { return dummyAddr{} }
+func (c *wedgedConn) RemoteAddr() net.Addr             { return dummyAddr{} }
+func (c *wedgedConn) SetDeadline(time.Time) error      { return nil }
+func (c *wedgedConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *wedgedConn) SetWriteDeadline(time.Time) error { return nil }
+
+type dummyAddr struct{}
+
+func (dummyAddr) Network() string { return "wedged" }
+func (dummyAddr) String() string  { return "wedged" }
+
+// Closing a connection has to abort whatever is stuck writing on it. The
+// resumable session replaces a dead link by closing it, so a Close that queued
+// behind the wedged write would leave the replacement idle until the write
+// deadline expired — and the close frame is only a courtesy, not worth waiting
+// for.
+func TestWSConnCloseDoesNotWaitForAWedgedWrite(t *testing.T) {
+	inner := newWedgedConn()
+	ws := newWSConn(inner, true, false)
+
+	writing := make(chan struct{})
+	go func() {
+		close(writing)
+		_, _ = ws.Write([]byte("stuck on a dead path"))
+	}()
+	<-writing
+	// Give the writer time to park inside inner.Write holding the write lock.
+	time.Sleep(50 * time.Millisecond)
+
+	closed := make(chan struct{})
+	go func() {
+		_ = ws.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close blocked behind a wedged write; a reattach would stall until the write deadline")
 	}
 }

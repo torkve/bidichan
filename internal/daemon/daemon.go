@@ -126,6 +126,23 @@ type Config struct {
 	// command-wrapper to surface tunnel loss to the user.
 	OnPeerDown func()
 
+	// DisableResume turns off session resumption. With it on (the default) a
+	// connect-side daemon rides out a network outage — the peer, its channels
+	// and the TCP connections inside them stay open and pick up where they
+	// left off — and a listen-side daemon holds a peer's session for the same
+	// window so its client can come back to it. Turning it off restores the
+	// older behaviour where losing the network ends the peer.
+	DisableResume bool
+
+	// ResumeGrace overrides how long an outage may last before the peer is
+	// declared lost. Zero uses the transport default.
+	ResumeGrace time.Duration
+
+	// OnLinkState, if set (connect side), reports transport link transitions
+	// while the peer stays up, so a host can show "reconnecting" instead of
+	// tearing its tunnel down.
+	OnLinkState func(state transport.LinkState, err error)
+
 	// Logger; default if nil.
 	Logger *log.Logger
 }
@@ -202,14 +219,16 @@ func (d *Daemon) runListen(ctx context.Context) error {
 		_ = os.Remove(d.cfg.BindAddr) // remove stale socket
 	}
 	lis, err := transport.Listen(ctx, d.cfg.BindAddr, transport.ServerConfig{
-		Hostname:     d.cfg.Hostname,
-		PSK:          d.cfg.PSK,
-		CertPath:     d.cfg.CertPath,
-		KeyPath:      d.cfg.KeyPath,
-		Logger:       d.logger,
-		Network:      d.cfg.TransportNetwork,
-		DecoyBackend: d.cfg.DecoyBackend,
-		Path:         d.cfg.Path,
+		Hostname:      d.cfg.Hostname,
+		PSK:           d.cfg.PSK,
+		CertPath:      d.cfg.CertPath,
+		KeyPath:       d.cfg.KeyPath,
+		Logger:        d.logger,
+		Network:       d.cfg.TransportNetwork,
+		DecoyBackend:  d.cfg.DecoyBackend,
+		Path:          d.cfg.Path,
+		DisableResume: d.cfg.DisableResume,
+		ResumeConfig:  transport.ResumeConfig{Grace: d.cfg.ResumeGrace},
 	})
 	if err != nil {
 		return err
@@ -255,7 +274,7 @@ func (d *Daemon) runConnect(ctx context.Context) error {
 			return fmt.Errorf("--cacert %s: no certificates found", d.cfg.CACert)
 		}
 	}
-	c, err := transport.Dial(ctx, d.cfg.RemoteAddr, transport.ClientConfig{
+	cliCfg := transport.ClientConfig{
 		Hostname:    d.cfg.Hostname,
 		PSK:         d.cfg.PSK,
 		RootCAs:     rootCAs,
@@ -263,7 +282,17 @@ func (d *Daemon) runConnect(ctx context.Context) error {
 		SkipBinding: d.cfg.SkipBinding,
 		Path:        d.cfg.Path,
 		HelloID:     d.cfg.HelloID,
-	})
+		ResumeConfig: transport.ResumeConfig{
+			Grace:  d.cfg.ResumeGrace,
+			Logger: d.logger,
+		},
+		OnLinkState: d.cfg.OnLinkState,
+	}
+	dial := transport.DialSession
+	if d.cfg.DisableResume {
+		dial = transport.Dial
+	}
+	c, err := dial(ctx, d.cfg.RemoteAddr, cliCfg)
 	if err != nil {
 		return err
 	}
@@ -280,9 +309,12 @@ func (d *Daemon) runConnect(ctx context.Context) error {
 	if d.cfg.OnReady != nil {
 		d.cfg.OnReady()
 	}
-	// Run until shutdown is requested or the peer connection drops. A connect
-	// daemon owns a single outbound peer and does not reconnect, so peer loss
-	// is terminal: return an error so the process exits non-zero (a systemd
+	// Run until shutdown is requested or the peer connection drops. With
+	// resumption on, a transport outage no longer reaches this point: the
+	// connection stalls and redials underneath, and the peer only goes down
+	// once the grace period is exhausted or the server has forgotten the
+	// session. That remains terminal for this daemon, which owns a single
+	// outbound peer: return an error so the process exits non-zero (a systemd
 	// unit with Restart=on-failure then redials). The command wrapper handles
 	// its own lifetime — it ignores this return and keeps the command running
 	// after surfacing the loss via OnPeerDown.
@@ -397,6 +429,16 @@ func (d *Daemon) Peers() []*peer.Peer {
 		out = append(out, p)
 	}
 	return out
+}
+
+// NetworkChanged tells every peer's transport that the network underneath it
+// has changed, so a resumable connection drops its now-dead socket and redials
+// at once instead of waiting for a timeout to notice. Peers on a plain
+// transport are left alone. Safe to call at any time.
+func (d *Daemon) NetworkChanged() {
+	for _, p := range d.Peers() {
+		transport.DropLink(p.Conn())
+	}
 }
 
 // PeerByID returns the peer for the given id, or nil.
