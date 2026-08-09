@@ -35,9 +35,11 @@ type SocketProtector interface {
 // have detached it (ParcelFileDescriptor.detachFd) and must not close it
 // afterwards. protector, when non-nil, keeps our own socket out of the tunnel.
 func (c *Client) Start(cfg *Config, tunFD int, protector SocketProtector) error {
+	registered := false
 	register := func() {
 		if tunFD > 0 {
 			registerFDFactory(tunFD)
+			registered = true
 		}
 	}
 	tweak := func(dcfg *daemon.Config) {
@@ -45,7 +47,21 @@ func (c *Client) Start(cfg *Config, tunFD int, protector SocketProtector) error 
 			dcfg.DialControl = protectControl(protector)
 		}
 	}
-	return c.start(cfg, tweak, register, clearTUNDevice)
+	onFail := func() {
+		if tunFD > 0 {
+			clearTUNDevice()
+		}
+	}
+	err := c.start(cfg, tweak, register, onFail)
+	// The configuration can be rejected before register ever runs, and by then
+	// the host has already detached the descriptor and is no longer allowed to
+	// close it. Nothing else holds it, so close it here or it keeps the device
+	// open for the life of the process. Both callbacks run synchronously inside
+	// start, so this needs no synchronisation.
+	if err != nil && tunFD > 0 && !registered {
+		_ = syscall.Close(tunFD)
+	}
+	return err
 }
 
 // SetTunFD points tun channels at a new device. The host calls it with a fresh

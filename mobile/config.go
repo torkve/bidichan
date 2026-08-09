@@ -15,6 +15,14 @@ import (
 // Client.Start.
 type Config struct {
 	// Addr is the server host:port (e.g. "ws.example.com:443").
+	//
+	// On Android, prefer an IP literal here and carry the name in Hostname.
+	// Only the connection socket can be kept out of the tunnel; the name
+	// lookup that would precede it cannot, so on a device whose packet
+	// interface is already up a hostname here can be resolved into the very
+	// tunnel we are trying to establish. Hostname still supplies the SNI and
+	// the certificate is still verified against it, so an IP literal costs
+	// nothing.
 	Addr string
 	// Hostname is the SNI and the HTTP Host header.
 	Hostname string
@@ -62,8 +70,9 @@ func fingerprintID(name string) (utls.ClientHelloID, error) {
 	case "safari":
 		return utls.HelloSafari_Auto, nil
 	case "android":
-		// Chrome's hello is what an Android device presents; the User-Agent
-		// that goes with it is picked from the same name (see userAgent).
+		// OkHttp's hello — what the overwhelming majority of Android apps
+		// present. The User-Agent that belongs with it is picked from the same
+		// name (see userAgent), and must be an app's rather than a browser's.
 		return utls.HelloAndroid_11_OkHttp, nil
 	case "chrome":
 		return utls.HelloChrome_Auto, nil
