@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"syscall"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -65,6 +66,14 @@ type ClientConfig struct {
 	// OnLinkState, when set, is called by DialSession's supervisor on every
 	// link transition, so a host can distinguish "reconnecting" from "gone".
 	OnLinkState func(state LinkState, err error)
+
+	// Control, when set, runs on the raw socket before every outbound dial,
+	// exactly like net.Dialer.Control. A host that routes traffic into the
+	// tunnel needs this to keep the tunnel's own connection out of it, and it
+	// has to apply to every dial — the resumable session redials on its own
+	// whenever the network moves, and a redial that skipped this would loop
+	// the tunnel through itself.
+	Control func(network, address string, c syscall.RawConn) error
 }
 
 // Dial opens a connection to addr and performs the auth handshake. The
@@ -94,7 +103,7 @@ func dial(ctx context.Context, addr string, cfg ClientConfig, resume *resumeRequ
 		return nil, nil, fmt.Errorf("transport: invalid network %q", network)
 	}
 
-	d := net.Dialer{}
+	d := net.Dialer{Control: cfg.Control}
 	if network == "tcp" {
 		// Use a jittered keepalive interval per connection.
 		d.KeepAlive = randDuration(20*time.Second, 40*time.Second)
@@ -202,12 +211,19 @@ func chromeNoECHSpec() (utls.ClientHelloSpec, error) {
 
 // userAgent returns an HTTP User-Agent consistent with the TLS fingerprint id.
 // A Chrome JA3 paired with a Chrome UA is coherent; an iOS/Safari JA3 must not
-// ship a Chrome-on-Windows UA, which would itself be a fingerprinting tell.
+// ship a Chrome-on-Windows UA, and an OkHttp JA3 must not claim to be a
+// browser — each mismatch is itself a fingerprinting tell.
 func userAgent(id utls.ClientHelloID) string {
 	switch id.Client {
 	case "iOS":
 		return "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) " +
 			"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+	case "Android":
+		// The Android hello is OkHttp's, which is what the overwhelming
+		// majority of Android apps speak, so the User-Agent has to be an app's
+		// rather than a browser's — a browser hello paired with an OkHttp
+		// fingerprint would not survive a second look.
+		return "okhttp/4.12.0"
 	case "Safari":
 		return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
 			"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"

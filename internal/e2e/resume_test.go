@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -400,4 +401,100 @@ func waitForListenAddr(t *testing.T, p *peer.Peer) string {
 	}
 	t.Fatal("could not learn the forward listener address")
 	return ""
+}
+
+// A host that routes traffic into the tunnel has to keep the tunnel's own
+// socket out of it, and the hook that does so runs per dial. The resumable
+// session redials on its own whenever the network moves, so a redial that
+// skipped the hook would quietly loop the tunnel through itself — this pins
+// that every dial, not just the first, goes through it.
+func TestDialControlRunsOnEveryRedial(t *testing.T) {
+	psk := mustPSK(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logger := log.New(io.Discard, "", 0)
+
+	lis, err := transport.Listen(ctx, "127.0.0.1:0", transport.ServerConfig{
+		Hostname:     "example.test",
+		PSK:          psk,
+		Logger:       logger,
+		ResumeConfig: transport.ResumeConfig{Grace: 10 * time.Second},
+	})
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer lis.Close()
+	go func() {
+		for {
+			c, err := lis.Accept(ctx)
+			if err != nil {
+				return
+			}
+			p, err := peer.NewPeer(peer.RoleServer, c, "srv", logger)
+			if err != nil {
+				continue
+			}
+			channel.Register(p)
+			if err := p.Start(ctx); err != nil {
+				_ = p.Close()
+			}
+		}
+	}()
+
+	relay := newTCPRelay(t, lis.Addr().String())
+
+	var mu sync.Mutex
+	dials := 0
+	conn, err := transport.DialSession(ctx, relay.addr(), transport.ClientConfig{
+		Hostname:     "example.test",
+		PSK:          psk,
+		RootCAs:      rootsFor(t, lis),
+		ResumeConfig: transport.ResumeConfig{Grace: 10 * time.Second, Logger: logger},
+		Control: func(network, address string, c syscall.RawConn) error {
+			mu.Lock()
+			dials++
+			mu.Unlock()
+			// Prove we really get a usable socket, not just a callback.
+			return c.Control(func(fd uintptr) {
+				if fd == 0 {
+					t.Error("Control got a zero descriptor")
+				}
+			})
+		},
+	})
+	if err != nil {
+		t.Fatalf("DialSession: %v", err)
+	}
+	defer conn.Close()
+
+	cli, err := peer.NewPeer(peer.RoleClient, conn, "cli", logger)
+	if err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	channel.Register(cli)
+	if err := cli.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer cli.Close()
+
+	mu.Lock()
+	first := dials
+	mu.Unlock()
+	if first == 0 {
+		t.Fatal("the first dial did not go through Control")
+	}
+
+	// Force the session to redial, then confirm the hook ran again.
+	relay.cut()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := dials
+		mu.Unlock()
+		if n > first {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("a redial happened without going through Control")
 }

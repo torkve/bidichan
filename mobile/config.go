@@ -1,4 +1,4 @@
-//go:build ios
+//go:build ios || android
 
 package mobile
 
@@ -11,7 +11,8 @@ import (
 
 // Config carries the connect-side settings for the mobile client. Every field
 // is a gomobile-bindable scalar or []byte so the struct crosses cleanly into
-// Swift. Build one with NewConfig, set the fields, and pass it to Client.Start.
+// Swift or Kotlin. Build one with NewConfig, set the fields, and pass it to
+// Client.Start.
 type Config struct {
 	// Addr is the server host:port (e.g. "ws.example.com:443").
 	Addr string
@@ -28,8 +29,11 @@ type Config struct {
 	// CACertPEM optionally pins the server to a PEM CA bundle. Empty uses the
 	// system trust store.
 	CACertPEM []byte
-	// Fingerprint selects the uTLS ClientHello to mimic: "ios" (default),
-	// "safari", or "chrome".
+	// Fingerprint selects the uTLS ClientHello to mimic, together with a
+	// matching User-Agent: "ios" (default), "android", "safari" or "chrome".
+	// Set it to whatever the device it runs on would plausibly present — a
+	// hello and a User-Agent that disagree about the platform are themselves a
+	// tell.
 	Fingerprint string
 	// MemoryLimitMB sets a soft Go heap limit (runtime/debug.SetMemoryLimit) so
 	// the runtime stays under the Network Extension's memory cap. 0 leaves it
@@ -43,7 +47,8 @@ type Config struct {
 	ResumeGraceSeconds int
 }
 
-// NewConfig returns a Config with iOS-appropriate defaults.
+// NewConfig returns a Config with mobile-appropriate defaults. Hosts on
+// platforms other than iOS should set Fingerprint to match.
 func NewConfig() *Config {
 	return &Config{Fingerprint: "ios"}
 }
@@ -56,9 +61,13 @@ func fingerprintID(name string) (utls.ClientHelloID, error) {
 		return utls.HelloIOS_Auto, nil
 	case "safari":
 		return utls.HelloSafari_Auto, nil
+	case "android":
+		// Chrome's hello is what an Android device presents; the User-Agent
+		// that goes with it is picked from the same name (see userAgent).
+		return utls.HelloAndroid_11_OkHttp, nil
 	case "chrome":
 		return utls.HelloChrome_Auto, nil
 	default:
-		return utls.ClientHelloID{}, fmt.Errorf("unknown fingerprint %q (want ios|safari|chrome)", name)
+		return utls.ClientHelloID{}, fmt.Errorf("unknown fingerprint %q (want ios|android|safari|chrome)", name)
 	}
 }

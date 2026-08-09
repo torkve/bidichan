@@ -1,11 +1,11 @@
-//go:build !linux
+//go:build !linux || android
 
 package channel
 
-// configureInterface is a no-op off Linux. On macOS the operator configures the
-// device out of band; on iOS addressing is applied by the Packet Tunnel
-// Provider via NEPacketTunnelNetworkSettings from the same TUNSpec CIDR/MTU, so
-// there is nothing to do in-process here.
+// configureInterface is a no-op wherever this process does not own the device.
+// On macOS the operator configures it out of band; on iOS and Android the host
+// applies the addressing when it creates the device, from the same TUNSpec
+// CIDR/MTU, so there is nothing to do in-process here.
 func configureInterface(dev, cidr, cidr6 string, mtu int) error {
 	return nil
 }

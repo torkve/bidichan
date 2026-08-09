@@ -1,9 +1,10 @@
-//go:build ios
+//go:build ios || android
 
-// Package mobile is the gomobile-bound iOS facade for the bidichan connect-side
-// client. It embeds the same transport/peer/channel core the CLI uses, driven
-// in-process (no control socket) so an iOS Packet Tunnel Provider can host the
-// long-lived peer connection and manage channels from Swift.
+// Package mobile is the gomobile-bound mobile facade for the bidichan
+// connect-side client. It embeds the same transport/peer/channel core the CLI
+// uses, driven in-process (no control socket) so a host — an iOS Packet Tunnel
+// Provider, or an Android tunnel service — can hold the long-lived peer
+// connection and manage channels from Swift or Kotlin.
 package mobile
 
 import (
@@ -18,14 +19,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/torkve/bidichan/internal/channel"
 	"github.com/torkve/bidichan/internal/daemon"
 	"github.com/torkve/bidichan/internal/peer"
 	"github.com/torkve/bidichan/internal/transport"
 )
 
-// Client is the iOS-facing handle to an embedded connect-side daemon. It is safe
-// for concurrent use.
+// Client is the host-facing handle to an embedded connect-side daemon. It is
+// safe for concurrent use.
 //
 // A started client stays started. Losing the network does not end it: the
 // transport underneath resumes the same session, so the peer, its channels and
@@ -93,11 +93,21 @@ func (c *Client) reportLink(state string) {
 	}
 }
 
-// Start dials the server described by cfg and blocks until the peer link is up
-// (or the attempt fails). flow, when non-nil, backs any tun channel opened over
-// this client with the Packet Tunnel Provider's NEPacketTunnelFlow; pass nil if
-// no tun channel will be used.
-func (c *Client) Start(cfg *Config, flow PacketFlow) error {
+// start is the platform-independent half of Start: it validates cfg, builds the
+// daemon configuration, launches the supervisor and blocks until the first peer
+// link is up or the attempt fails.
+//
+// Each platform wraps it with its own Start, because what a host must supply
+// differs: iOS passes a packet flow it pumps itself, Android passes the
+// descriptor of the device the system gave it plus the means to keep our own
+// socket out of the tunnel.
+//
+// register installs whatever the host supplied, and runs only once the
+// configuration has been accepted and this client is known to be startable —
+// registering earlier would let a rejected Start replace the device a running
+// client is already using. onFail runs if the first attempt never came up, so
+// the platform wrapper can drop what it registered.
+func (c *Client) start(cfg *Config, tweak func(*daemon.Config), register, onFail func()) error {
 	if cfg == nil {
 		return errors.New("nil config")
 	}
@@ -135,8 +145,8 @@ func (c *Client) Start(cfg *Config, flow PacketFlow) error {
 	if cfg.MemoryLimitMB > 0 {
 		debug.SetMemoryLimit(int64(cfg.MemoryLimitMB) << 20)
 	}
-	if flow != nil {
-		registerTUNFactory(flow)
+	if register != nil {
+		register()
 	}
 	logger := newStdLogger(c.logger)
 
@@ -162,6 +172,9 @@ func (c *Client) Start(cfg *Config, flow PacketFlow) error {
 			c.reportLink(state.String())
 		},
 	}
+	if tweak != nil {
+		tweak(&dcfg)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -182,8 +195,7 @@ func (c *Client) Start(cfg *Config, flow PacketFlow) error {
 		// The first attempt failed before the peer was ever up — a bad address,
 		// a wrong PSK, a server that isn't there. Report it rather than
 		// retrying behind the user's back, and reset so Start can be called
-		// again. Clear the TUN factory too so we don't hold a reference to the
-		// now-unusable Swift PacketFlow.
+		// again.
 		c.mu.Lock()
 		startErr := c.runErr
 		c.d = nil
@@ -191,8 +203,8 @@ func (c *Client) Start(cfg *Config, flow PacketFlow) error {
 		c.cancel = nil
 		c.mu.Unlock()
 		cancel()
-		if flow != nil {
-			channel.SetTUNDeviceFactory(nil)
+		if onFail != nil {
+			onFail()
 		}
 		if startErr == nil {
 			startErr = errors.New("connection closed before ready")
@@ -302,9 +314,9 @@ func (c *Client) setRunErr(err error) {
 	c.mu.Unlock()
 }
 
-// Wait blocks until the session ends (peer lost or Stop called) and returns the
-// reason, if any. The Packet Tunnel Provider calls this on a background thread
-// and tears the tunnel down when it returns.
+// Wait blocks until the client stops for good and returns the reason, if any.
+// The host calls this on a background thread and tears its tunnel down when it
+// returns.
 func (c *Client) Wait() error {
 	c.mu.Lock()
 	done := c.done
@@ -357,7 +369,7 @@ func (c *Client) Stop() error {
 	c.cancel = nil
 	c.closed = true
 	c.mu.Unlock()
-	channel.SetTUNDeviceFactory(nil)
+	clearTUNDevice()
 	if cancel != nil {
 		cancel()
 	}
@@ -368,7 +380,7 @@ func (c *Client) Stop() error {
 }
 
 // NetworkChanged tells the transport that the device's network path has
-// changed — iOS knows this long before a socket on the old path times out.
+// changed — the host knows this long before a socket on the old path times out.
 // A resumable connection drops the dead socket and redials at once, so the
 // session (and everything running over it) resumes in about a round trip
 // instead of after an idle timeout. Safe to call at any time.
@@ -379,18 +391,6 @@ func (c *Client) NetworkChanged() {
 	if d != nil {
 		d.NetworkChanged()
 	}
-}
-
-// SetPacketFlow replaces the packet flow backing tun channels. The host calls
-// it with a fresh flow before reopening a tun channel on a rebuilt session:
-// closing the old channel closed the old flow, and the new one needs a live
-// pump. Passing nil clears it.
-func (c *Client) SetPacketFlow(flow PacketFlow) {
-	if flow == nil {
-		channel.SetTUNDeviceFactory(nil)
-		return
-	}
-	registerTUNFactory(flow)
 }
 
 // singlePeer returns the client's one peer (the connect side has exactly one).

@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -147,6 +148,12 @@ type Config struct {
 	// while the peer stays up, so a host can show "reconnecting" instead of
 	// tearing its tunnel down.
 	OnLinkState func(state transport.LinkState, err error)
+
+	// DialControl, if set (connect side), runs on the raw socket before every
+	// outbound dial, including the redials the resumable session makes by
+	// itself. A host that routes traffic into the tunnel uses it to keep the
+	// tunnel's own connection out of it.
+	DialControl func(network, address string, c syscall.RawConn) error
 
 	// Logger; default if nil.
 	Logger *log.Logger
@@ -296,6 +303,7 @@ func (d *Daemon) runConnect(ctx context.Context) error {
 			Logger: d.logger,
 		},
 		OnLinkState: d.cfg.OnLinkState,
+		Control:     d.cfg.DialControl,
 	}
 	dial := transport.DialSession
 	if d.cfg.DisableResume {

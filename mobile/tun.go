@@ -71,3 +71,37 @@ func registerTUNFactory(flow PacketFlow) {
 		return &flowDevice{flow: flow, name: name}, nil
 	})
 }
+
+// Start dials the server described by cfg and blocks until the peer link is up
+// (or the attempt fails). flow, when non-nil, backs any tun channel opened over
+// this client with the Packet Tunnel Provider's NEPacketTunnelFlow; pass nil if
+// no tun channel will be used.
+func (c *Client) Start(cfg *Config, flow PacketFlow) error {
+	register := func() {
+		if flow != nil {
+			registerTUNFactory(flow)
+		}
+	}
+	return c.start(cfg, nil, register, func() {
+		if flow != nil {
+			// Don't keep a reference to a flow we can no longer drive.
+			clearTUNDevice()
+		}
+	})
+}
+
+// SetPacketFlow replaces the packet flow backing tun channels. The host calls
+// it with a fresh flow before reopening a tun channel on a rebuilt session:
+// closing the old channel closed the old flow, and the new one needs a live
+// pump. Passing nil clears it.
+func (c *Client) SetPacketFlow(flow PacketFlow) {
+	if flow == nil {
+		clearTUNDevice()
+		return
+	}
+	registerTUNFactory(flow)
+}
+
+// clearTUNDevice drops whatever device is registered. On iOS the flow belongs
+// to the host, which closes it, so there is nothing to release here.
+func clearTUNDevice() { channel.SetTUNDeviceFactory(nil) }
