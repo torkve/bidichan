@@ -158,6 +158,21 @@ func TestEncodeRefusesAnUnusableProfile(t *testing.T) {
 	}
 }
 
+// testCAPEM is a fixed self-signed certificate. It has to be a real one —
+// validate loads it the same way the tunnel does — and it has to be this exact
+// one rather than freshly generated, because the golden payload below includes
+// it byte for byte. Nothing signs anything with it; it is only ever parsed.
+const testCAPEM = "-----BEGIN CERTIFICATE-----\n" +
+	"MIIBbTCCAROgAwIBAgIBATAKBggqhkjOPQQDAjAlMSMwIQYDVQQDExpiaWRpY2hh\n" +
+	"biBwcm9maWxlIGxpbmsgdGVzdDAgFw03MDAxMDEwMDAwMDBaGA8yMTAwMDEwMTAw\n" +
+	"MDAwMFowJTEjMCEGA1UEAxMaYmlkaWNoYW4gcHJvZmlsZSBsaW5rIHRlc3QwWTAT\n" +
+	"BgcqhkjOPQIBBggqhkjOPQMBBwNCAATWYNQsSLxMXetVm6rd3LM+Du7RrK2dlhbh\n" +
+	"YwQt0fEfU/iAuYj5u+DOR0d6b1rFfHu5pgJZf/aIl9+7QLvHEObSozIwMDAPBgNV\n" +
+	"HRMBAf8EBTADAQH/MB0GA1UdDgQWBBSX6+WQBsk6NbSSbPLqySLBwCBYJTAKBggq\n" +
+	"hkjOPQQDAgNIADBFAiBvfp0g+aaQkNgeBwKGYBzAKSc44zokFCalGBxn29TsmgIh\n" +
+	"ALbTTGwfL5w6zbSakqKpm6ImZRumf72QShZHajHqIgQu\n" +
+	"-----END CERTIFICATE-----\n"
+
 // everything is a link with every field set, so nothing can go unnoticed by
 // being zero.
 func everything() *Link {
@@ -167,7 +182,7 @@ func everything() *Link {
 		Host:               "gate.example.com",
 		Path:               "/events",
 		NoTLSBinding:       true,
-		CACertPEM:          "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+		CACertPEM:          testCAPEM,
 		EnableTUN:          true,
 		TUNCIDR:            "10.42.0.2/24",
 		TUNCIDR6:           "fd00:bd::2/64",
@@ -192,9 +207,22 @@ func everything() *Link {
 // present even though its label and routeSystem are empty, which is what keeps
 // a strict decoder on the other side from throwing the channel away.
 //
-// Changing this string is changing the format. Bump Version with it.
+// Changing this string is changing the format — bump Version with it. The one
+// exception is the certificate: it is a fixture, not part of the format, so if
+// it ever has to be replaced, update it here and in testCAPEM together and
+// leave Version alone.
 const goldenPayload = `{"v":1,"name":"gate","addr":"gate.example.com:443","host":"gate.example.com",` +
-	`"path":"/events","noBind":true,"ca":"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",` +
+	`"path":"/events","noBind":true,"ca":"` +
+	`-----BEGIN CERTIFICATE-----\n` +
+	`MIIBbTCCAROgAwIBAgIBATAKBggqhkjOPQQDAjAlMSMwIQYDVQQDExpiaWRpY2hh\n` +
+	`biBwcm9maWxlIGxpbmsgdGVzdDAgFw03MDAxMDEwMDAwMDBaGA8yMTAwMDEwMTAw\n` +
+	`MDAwMFowJTEjMCEGA1UEAxMaYmlkaWNoYW4gcHJvZmlsZSBsaW5rIHRlc3QwWTAT\n` +
+	`BgcqhkjOPQIBBggqhkjOPQMBBwNCAATWYNQsSLxMXetVm6rd3LM+Du7RrK2dlhbh\n` +
+	`YwQt0fEfU/iAuYj5u+DOR0d6b1rFfHu5pgJZf/aIl9+7QLvHEObSozIwMDAPBgNV\n` +
+	`HRMBAf8EBTADAQH/MB0GA1UdDgQWBBSX6+WQBsk6NbSSbPLqySLBwCBYJTAKBggq\n` +
+	`hkjOPQQDAgNIADBFAiBvfp0g+aaQkNgeBwKGYBzAKSc44zokFCalGBxn29TsmgIh\n` +
+	`ALbTTGwfL5w6zbSakqKpm6ImZRumf72QShZHajHqIgQu\n` +
+	`-----END CERTIFICATE-----\n",` +
 	`"tun":true,"cidr":"10.42.0.2/24","cidr6":"fd00:bd::2/64","mtu":1400,"full":true,"mem":40,"grace":90,` +
 	`"chans":[{"label":"web","kind":"http","allInterfaces":true,"port":3128,"target":"","routeSystem":true},` +
 	`{"label":"","kind":"forwardLocal","allInterfaces":false,"port":8080,"target":"10.0.0.5:80","routeSystem":false}],` +
@@ -205,9 +233,34 @@ func TestTheWireFormatIsExactlyThis(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := payloadOf(t, raw), goldenPayload; got != want {
-		t.Fatalf("the wire format changed — the other client cannot read this.\n got %s\nwant %s", got, want)
+	got, want := payloadOf(t, raw), goldenPayload
+	if got == want {
+		return
 	}
+	// Both are one long line, and the certificate in the middle makes them
+	// unreadable side by side. Point at where they diverge instead.
+	i := 0
+	for i < len(got) && i < len(want) && got[i] == want[i] {
+		i++
+	}
+	t.Fatalf("the wire format changed — the other client cannot read this.\n"+
+		"first difference at byte %d\n got %s\nwant %s",
+		i, excerptAround(got, i), excerptAround(want, i))
+}
+
+// excerptAround returns the 60 bytes on either side of i, so a golden failure
+// shows the part that differs rather than a kilobyte of certificate.
+func excerptAround(s string, i int) string {
+	const window = 60
+	start, end := max(0, i-window), min(len(s), i+window)
+	out := s[start:end]
+	if start > 0 {
+		out = "…" + out
+	}
+	if end < len(s) {
+		out += "…"
+	}
+	return out
 }
 
 // A channel carries all six keys even when five of them are empty. Without
@@ -304,6 +357,7 @@ func TestRefusesValuesTheCoreWouldNotAccept(t *testing.T) {
 		"target port too big":  func(l *Link) { l.Channels[1].Target = "10.0.0.5:99999" },
 		"target no port":       func(l *Link) { l.Channels[1].Target = "10.0.0.5:" },
 		"target v6 unbrack.":   func(l *Link) { l.Channels[1].Target = "fd00::1:80" },
+		"space in target":      func(l *Link) { l.Channels[1].Target = "10.0.0.5 :80" },
 	}
 	for name, poison := range cases {
 		l := everything()
@@ -436,11 +490,12 @@ func TestRefusesAnOversizedLink(t *testing.T) {
 }
 
 // And the sender is told, rather than the link failing on the device that
-// received it. A pasted CA bundle is how this is reached — nothing else a
-// profile carries is unbounded.
+// received it. A pasted CA bundle is the realistic way to reach this, being
+// the largest thing a profile carries. It has to be a real one, or it would be
+// refused for being junk before its size ever mattered.
 func TestEncodeRefusesALinkTooBigToImport(t *testing.T) {
 	l := sample()
-	l.CACertPEM = strings.Repeat("x", MaxBytes)
+	l.CACertPEM = strings.Repeat(testCAPEM, MaxBytes/len(testCAPEM)+2)
 	raw, err := l.Encode()
 	if err == nil {
 		if _, perr := Parse(raw); perr != nil {
@@ -450,5 +505,54 @@ func TestEncodeRefusesALinkTooBigToImport(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "too large") {
 		t.Fatalf("the error should say what is wrong: %v", err)
+	}
+}
+
+// A certificate that will not load is refused while it can be explained,
+// rather than at connect time — it is the same test mobile's (*Client).start
+// applies when it builds the certificate pool.
+func TestChecksTheCABundle(t *testing.T) {
+	l := sample()
+	l.CACertPEM = "-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----\n"
+	if _, err := l.Encode(); err == nil {
+		t.Fatal("encoded a profile whose CA bundle holds no certificate")
+	}
+	l.CACertPEM = testCAPEM
+	if _, err := l.Encode(); err != nil {
+		t.Fatalf("refused a real certificate: %v", err)
+	}
+}
+
+// The reason a link is refused is shown to whoever tried to import it, so a
+// value that fails two checks has to be reported as the one that matters. This
+// is what keeps the character checks ahead of the address parse.
+func TestSaysWhyRatherThanWhereItStopped(t *testing.T) {
+	l := sample()
+	l.Addr = "gate.example.com:443\r\n"
+	_, err := l.Encode()
+	if err == nil {
+		t.Fatal("encoded")
+	}
+	if !strings.Contains(err.Error(), "control character") {
+		t.Fatalf("reported as something other than what it is: %v", err)
+	}
+}
+
+// A profile name is a label the user reads, not something that reaches a
+// socket, so it keeps its spaces. Pinned because the check that exempts it is
+// one field of a table, and a table is easy to fill in wrongly.
+func TestANameMayContainSpaces(t *testing.T) {
+	l := sample()
+	l.Name = "Home gateway (spare)"
+	raw, err := l.Encode()
+	if err != nil {
+		t.Fatalf("refused a name with a space: %v", err)
+	}
+	out, err := Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Name != l.Name {
+		t.Fatalf("the name changed: %q", out.Name)
 	}
 }

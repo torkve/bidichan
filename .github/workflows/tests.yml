@@ -39,12 +39,13 @@ jobs:
         run: go vet ./...
 
       - name: build the mobile bindings
-        # ./mobile is behind `//go:build ios || android`, so the untagged
-        # build, vet and test steps above never compile a line of it. That
-        # matters most for the types it mirrors from internal packages: a
-        # field renamed or removed in the core leaves everything above green
-        # and breaks only the gomobile build, on the clients' CI. These steps
-        # are cheap and close that gap.
+        # Every file in ./mobile that does anything is behind an ios and/or
+        # android build tag — only doc.go, which is `!ios && !android`, is what
+        # the untagged build, vet and test steps above compile. So none of the
+        # implementation is checked up there. That matters most for the types
+        # it mirrors from internal packages: a field renamed or removed in the
+        # core leaves everything above green and breaks only the gomobile
+        # build, on the clients' CI. These steps are cheap and close that gap.
         #
         # No -tags: GOOS=ios and GOOS=android are what `//go:build ios ||
         # android` keys on. CGO stays off — this is a compile check, not a
@@ -60,11 +61,10 @@ jobs:
           GOOS=android GOARCH=arm CGO_ENABLED=0 go build ./mobile/
 
       - name: vet the mobile bindings
-        # go vet above is untagged too, so ./mobile has never been vetted.
-        # Android only: vet links a test binary, and GOOS=ios cannot without
-        # cgo, which needs a C toolchain we do not have here. Every file in
-        # the package is `ios || android` except tun.go and tun_android.go, so
-        # this covers all but the one iOS-only file.
+        # Android only: vet links a test binary, and GOOS=ios cannot do that
+        # without cgo, which needs a C toolchain we do not have here. Between
+        # this and the untagged vet above, which covers doc.go, the only file
+        # in the package left unvetted anywhere is the iOS-only tun.go.
         run: GOOS=android GOARCH=arm64 CGO_ENABLED=0 go vet ./mobile/
 
       - name: Pre-pull nginx:alpine

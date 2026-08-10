@@ -15,6 +15,7 @@
 package profilelink
 
 import (
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -143,7 +144,7 @@ func (l *Link) Encode() (string, error) {
 	link := Scheme + "://" + Host + "#" + base64.RawURLEncoding.EncodeToString(payload)
 	// The same limit Parse applies, checked here so the refusal lands on the
 	// device that can still do something about it. A pasted CA bundle is the
-	// way to reach it: nothing else here is unbounded.
+	// realistic way to reach it, being the largest thing a profile carries.
 	if len(link) > MaxBytes {
 		return "", fmt.Errorf("profile link: too large (%d bytes, limit %d)", len(link), MaxBytes)
 	}
@@ -207,16 +208,26 @@ func (l *Link) validate() error {
 	// Character checks first, so a poisoned value is reported as what it is
 	// rather than as whatever it happens to also fail.
 	//
-	// The transport composes the upgrade request by hand, so a control
-	// character in any of these would let whoever wrote the link decide what
-	// request the importing device sends — to a host they also chose. A space
-	// is not a control character but is just as unwelcome in the three that end
-	// up in the request: it ends the target in the request line, and makes a
-	// header malformed. None of these can legitimately contain either.
+	// The transport composes the upgrade request by hand (see transport.dial),
+	// and Hostname and Path go into it as text, so a control character in
+	// either would let whoever wrote the link decide what request the importing
+	// device sends — to a host they also chose. Addr and the channel targets do
+	// not reach the request; they are dialed. They are checked all the same,
+	// because a control character has no place in an address either and
+	// net.SplitHostPort will not object to one.
+	//
+	// A space is not a control character, but is just as unwelcome anywhere
+	// that reaches the request text or a dial: it ends the target in the
+	// request line, it makes a header malformed, and net.SplitHostPort accepts
+	// one without complaint. Only `name` is exempt — it is a label the user
+	// reads, and never reaches the request or a dial.
 	for _, f := range []struct {
-		what      string
-		value     string
-		inRequest bool
+		what  string
+		value string
+		// noSpaces is set where a space would change the request we send, or
+		// would slip past SplitHostPort and into a dial. Not "is a host":
+		// `path` is neither, and still cannot hold one.
+		noSpaces bool
 	}{
 		{"server address", l.Addr, true},
 		{"hostname", l.Host, true},
@@ -226,7 +237,7 @@ func (l *Link) validate() error {
 		if hasControl(f.value) {
 			return fmt.Errorf("profile link: %s contains a control character", f.what)
 		}
-		if f.inRequest && strings.Contains(f.value, " ") {
+		if f.noSpaces && strings.Contains(f.value, " ") {
 			return fmt.Errorf("profile link: %s %q contains a space", f.what, f.value)
 		}
 	}
@@ -246,6 +257,14 @@ func (l *Link) validate() error {
 		if _, err := hex.DecodeString(l.PSKHex); err != nil {
 			return errors.New("profile link: the key is not valid hex")
 		}
+	}
+	// The same test the certificate has to pass when the profile is used
+	// (mobile's (*Client).start builds its pool this way), so nothing is
+	// refused here that would have connected. It is also the field most likely to arrive as a
+	// mis-paste, and the largest, which makes it the one worth refusing before
+	// it becomes what pushes a link past MaxBytes.
+	if l.CACertPEM != "" && !x509.NewCertPool().AppendCertsFromPEM([]byte(l.CACertPEM)) {
+		return errors.New("profile link: no certificates found in the CA bundle")
 	}
 	if l.TUNMTU != 0 && (l.TUNMTU < minTunMTU || l.TUNMTU > maxTunMTU) {
 		return fmt.Errorf("profile link: MTU %d is outside %d-%d", l.TUNMTU, minTunMTU, maxTunMTU)
@@ -289,6 +308,13 @@ func (l *Link) validate() error {
 	for i, c := range l.Channels {
 		if hasControl(c.Target) || hasControl(c.Label) {
 			return fmt.Errorf("profile link: channel %d contains a control character", i+1)
+		}
+		// The label is a name the user reads and may contain spaces. A target
+		// may not, for the same reason the server address may not — and this
+		// is checked for every kind, not just the ones that dial it, because
+		// a space is never meaningful there.
+		if strings.Contains(c.Target, " ") {
+			return fmt.Errorf("profile link: channel %d target %q contains a space", i+1, c.Target)
 		}
 		if !knownKinds[c.Kind] {
 			return fmt.Errorf("profile link: channel %d has an unknown kind %q", i+1, c.Kind)
