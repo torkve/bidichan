@@ -17,42 +17,47 @@ import (
 // as JSON, because a list of structs cannot cross into Swift or Kotlin. The
 // JSON is validated here, so a malformed channel is refused on the way out
 // rather than surfacing on someone else's device.
+//
+// The field names avoid runs of capitals on purpose. The binding lowercases a
+// leading acronym in ways that are easy to get wrong from the other side —
+// TUNCIDR would arrive as `tuncidr` — and two languages have to spell every one
+// of these correctly, so each name is plain camel case instead.
 type ProfileLink struct {
 	Name         string
 	Addr         string
 	Hostname     string
 	Path         string
-	NoTLSBinding bool
+	NoTlsBinding bool
 	Fingerprint  string
-	CACertPEM    string
+	CaCertPem    string
 
-	EnableTUN  bool
-	TUNCIDR    string
-	TUNCIDR6   string
-	TUNMTU     int
+	EnableTun  bool
+	TunCidr    string
+	TunCidr6   string
+	TunMtu     int
 	FullTunnel bool
 
-	MemoryLimitMB      int
+	MemoryLimitMb      int
 	ResumeGraceSeconds int
 
-	// ChannelsJSON is the profile's default channels, as the array both
+	// ChannelsJson is the profile's default channels, as the array both
 	// clients already persist: label, kind, allInterfaces, port, target,
 	// routeSystem. Empty means none.
-	ChannelsJSON string
+	ChannelsJson string
 
-	// PSKHex is the pre-shared key, and is optional.
+	// PskHex is the pre-shared key, and is optional.
 	//
 	// A link carrying it is a credential: whoever holds the link can use the
 	// tunnel. Nothing here protects it — the encoding is reversible by design
 	// — so ask before including it, and say so when one arrives.
-	PSKHex string
+	PskHex string
 }
 
 // NewProfileLink returns an empty link to fill in.
 func NewProfileLink() *ProfileLink { return &ProfileLink{} }
 
 // HasSecret reports whether the pre-shared key is included.
-func (p *ProfileLink) HasSecret() bool { return p.PSKHex != "" }
+func (p *ProfileLink) HasSecret() bool { return p.PskHex != "" }
 
 // Encode renders the shareable link, refusing a profile that could not be
 // imported on the other side.
@@ -62,20 +67,20 @@ func (p *ProfileLink) Encode() (string, error) {
 		Addr:               p.Addr,
 		Host:               p.Hostname,
 		Path:               p.Path,
-		NoTLSBinding:       p.NoTLSBinding,
+		NoTLSBinding:       p.NoTlsBinding,
 		Fingerprint:        p.Fingerprint,
-		CACertPEM:          p.CACertPEM,
-		EnableTUN:          p.EnableTUN,
-		TUNCIDR:            p.TUNCIDR,
-		TUNCIDR6:           p.TUNCIDR6,
-		TUNMTU:             p.TUNMTU,
+		CACertPEM:          p.CaCertPem,
+		EnableTUN:          p.EnableTun,
+		TUNCIDR:            p.TunCidr,
+		TUNCIDR6:           p.TunCidr6,
+		TUNMTU:             p.TunMtu,
 		FullTunnel:         p.FullTunnel,
-		MemoryLimitMB:      p.MemoryLimitMB,
+		MemoryLimitMB:      p.MemoryLimitMb,
 		ResumeGraceSeconds: p.ResumeGraceSeconds,
-		PSKHex:             p.PSKHex,
+		PSKHex:             p.PskHex,
 	}
-	if p.ChannelsJSON != "" {
-		if err := json.Unmarshal([]byte(p.ChannelsJSON), &l.Channels); err != nil {
+	if p.ChannelsJson != "" {
+		if err := json.Unmarshal([]byte(p.ChannelsJson), &l.Channels); err != nil {
 			return "", fmt.Errorf("profile link: channels: %w", err)
 		}
 	}
@@ -94,24 +99,24 @@ func ParseProfileLink(raw string) (*ProfileLink, error) {
 		Addr:               l.Addr,
 		Hostname:           l.Host,
 		Path:               l.Path,
-		NoTLSBinding:       l.NoTLSBinding,
+		NoTlsBinding:       l.NoTLSBinding,
 		Fingerprint:        l.Fingerprint,
-		CACertPEM:          l.CACertPEM,
-		EnableTUN:          l.EnableTUN,
-		TUNCIDR:            l.TUNCIDR,
-		TUNCIDR6:           l.TUNCIDR6,
-		TUNMTU:             l.TUNMTU,
+		CaCertPem:          l.CACertPEM,
+		EnableTun:          l.EnableTUN,
+		TunCidr:            l.TUNCIDR,
+		TunCidr6:           l.TUNCIDR6,
+		TunMtu:             l.TUNMTU,
 		FullTunnel:         l.FullTunnel,
-		MemoryLimitMB:      l.MemoryLimitMB,
+		MemoryLimitMb:      l.MemoryLimitMB,
 		ResumeGraceSeconds: l.ResumeGraceSeconds,
-		PSKHex:             l.PSKHex,
+		PskHex:             l.PSKHex,
 	}
 	if len(l.Channels) > 0 {
 		b, err := json.Marshal(l.Channels)
 		if err != nil {
 			return nil, fmt.Errorf("profile link: channels: %w", err)
 		}
-		out.ChannelsJSON = string(b)
+		out.ChannelsJson = string(b)
 	}
 	return out, nil
 }
