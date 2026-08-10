@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"unicode"
 )
 
 // Scheme and Host make up the prefix both clients register with their platform.
@@ -31,6 +32,16 @@ const (
 	// Version is the payload version. A reader that does not know a version
 	// refuses the link rather than guessing at its meaning.
 	Version = 1
+
+	// MaxBytes caps the link. A real profile, including a CA certificate, is a
+	// few kilobytes; this leaves generous room while keeping a link someone
+	// sent us from turning into an arbitrary allocation.
+	MaxBytes = 64 << 10
+
+	// MaxChannels caps the default channels a link may carry. They are opened
+	// on connect, so an unbounded list is an unbounded amount of work asked of
+	// the device and the peer.
+	MaxChannels = 32
 )
 
 // Link is everything needed to recreate a profile elsewhere. It deliberately
@@ -106,7 +117,11 @@ func (l *Link) Encode() (string, error) {
 
 // Parse reads a link produced by Encode, on this or any other client.
 func Parse(raw string) (*Link, error) {
-	u, err := url.Parse(strings.TrimSpace(raw))
+	raw = strings.TrimSpace(raw)
+	if len(raw) > MaxBytes {
+		return nil, fmt.Errorf("profile link: too large (%d bytes, limit %d)", len(raw), MaxBytes)
+	}
+	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("profile link: %w", err)
 	}
@@ -142,9 +157,13 @@ func newerOrOlder(v int) string {
 	return "older"
 }
 
-// validate rejects a link that would produce a profile which cannot connect.
-// It checks only what is structurally required — whether the server answers is
-// not something a link can know.
+// validate rejects a link that would produce a profile which cannot connect,
+// or one that should not be acted on at all.
+//
+// A link arrives from outside — someone sends it — so this is a trust boundary
+// in the same sense as a peer-supplied channel spec (see channel.sanitizeTUNSpec),
+// and every field that later reaches a socket or the wire is checked here
+// rather than where it is used.
 func (l *Link) validate() error {
 	if l.Addr == "" {
 		return errors.New("profile link: no server address")
@@ -155,7 +174,27 @@ func (l *Link) validate() error {
 	if !strings.Contains(l.Addr, ":") {
 		return fmt.Errorf("profile link: server address %q has no port", l.Addr)
 	}
+	// The transport composes the upgrade request by hand, so a control
+	// character in any of these would let whoever wrote the link decide what
+	// request the importing device sends — to a host they also chose.
+	for _, f := range []struct{ what, value string }{
+		{"server address", l.Addr},
+		{"hostname", l.Host},
+		{"path", l.Path},
+		{"fingerprint", l.Fingerprint},
+		{"name", l.Name},
+	} {
+		if hasControl(f.value) {
+			return fmt.Errorf("profile link: %s contains a control character", f.what)
+		}
+	}
+	if len(l.Channels) > MaxChannels {
+		return fmt.Errorf("profile link: %d channels, limit %d", len(l.Channels), MaxChannels)
+	}
 	for i, c := range l.Channels {
+		if hasControl(c.Target) || hasControl(c.Label) {
+			return fmt.Errorf("profile link: channel %d contains a control character", i+1)
+		}
 		if !knownKinds[c.Kind] {
 			return fmt.Errorf("profile link: channel %d has an unknown kind %q", i+1, c.Kind)
 		}
@@ -167,4 +206,10 @@ func (l *Link) validate() error {
 		}
 	}
 	return nil
+}
+
+// hasControl reports whether s carries anything that is not printable text —
+// CR and LF above all, which are what would end one header and begin another.
+func hasControl(s string) bool {
+	return strings.ContainsFunc(s, unicode.IsControl)
 }

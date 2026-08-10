@@ -198,3 +198,60 @@ func mustJSON(t *testing.T, v any) string {
 	}
 	return string(b)
 }
+
+// A link is something someone else sent. The transport composes the upgrade
+// request by hand, so a control character in any field that reaches it would
+// let the link's author decide what request the importing device sends — to a
+// host they also chose. None of these may survive.
+func TestRefusesControlCharacters(t *testing.T) {
+	cases := map[string]func(*Link){
+		"path":        func(l *Link) { l.Path = "/x HTTP/1.1\r\nX-Injected: 1\r\nGET /" },
+		"hostname":    func(l *Link) { l.Host = "gate.example.com\r\nX-Injected: 1" },
+		"address":     func(l *Link) { l.Addr = "gate.example.com:443\r\n" },
+		"fingerprint": func(l *Link) { l.Fingerprint = "ios\r\n" },
+		"name":        func(l *Link) { l.Name = "a\nb" },
+		"target":      func(l *Link) { l.Channels[1].Target = "10.0.0.5:80\r\nX: 1" },
+		"label":       func(l *Link) { l.Channels[0].Label = "a\r\nb" },
+		"tab":         func(l *Link) { l.Path = "/a\tb" },
+	}
+	for name, poison := range cases {
+		l := sample()
+		poison(l)
+		if _, err := l.Encode(); err == nil {
+			t.Errorf("%s: encoded", name)
+		}
+		// And a hand-built payload must not get in either, since a link does
+		// not have to have been produced by Encode.
+		l.Version = Version
+		payload, _ := json.Marshal(l)
+		raw := "bidichan://profile#" + base64.RawURLEncoding.EncodeToString(payload)
+		if _, err := Parse(raw); err == nil {
+			t.Errorf("%s: parsed", name)
+		}
+	}
+}
+
+// The channels in a link are opened on connect, so an unbounded list is an
+// unbounded amount of work asked of the device and the peer.
+func TestRefusesTooManyChannels(t *testing.T) {
+	l := sample()
+	l.Channels = make([]Channel, MaxChannels+1)
+	for i := range l.Channels {
+		l.Channels[i] = Channel{Kind: "http", Port: 3128}
+	}
+	if _, err := l.Encode(); err == nil {
+		t.Fatal("encoded a link with more channels than the limit")
+	}
+	l.Channels = l.Channels[:MaxChannels]
+	if _, err := l.Encode(); err != nil {
+		t.Fatalf("refused a link at exactly the limit: %v", err)
+	}
+}
+
+// Nothing should turn a link someone sent into an arbitrary allocation.
+func TestRefusesAnOversizedLink(t *testing.T) {
+	huge := "bidichan://profile#" + strings.Repeat("A", MaxBytes)
+	if _, err := Parse(huge); err == nil {
+		t.Fatal("parsed an oversized link")
+	}
+}

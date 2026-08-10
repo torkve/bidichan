@@ -12,8 +12,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	utls "github.com/refraction-networking/utls"
 )
@@ -102,6 +104,16 @@ func dial(ctx context.Context, addr string, cfg ClientConfig, resume *resumeRequ
 	if network != "tcp" && network != "unix" {
 		return nil, nil, fmt.Errorf("transport: invalid network %q", network)
 	}
+	// The upgrade request below is composed by hand, so anything that ends a
+	// line would let whoever supplied these compose the request instead of us.
+	// They reach here from a config file, a command line, or a profile someone
+	// shared, so check them at the point of use as well as at import.
+	if err := checkHeaderSafe("hostname", cfg.Hostname); err != nil {
+		return nil, nil, err
+	}
+	if err := checkHeaderSafe("path", cfg.Path); err != nil {
+		return nil, nil, err
+	}
 
 	d := net.Dialer{Control: cfg.Control}
 	if network == "tcp" {
@@ -170,6 +182,15 @@ func dial(ctx context.Context, addr string, cfg ClientConfig, resume *resumeRequ
 	// Wrap the data phase in real RFC 6455 framing (client masks) so the
 	// post-101 bytes are valid WebSocket frames, not raw yamux.
 	return newWSConn(newBufferedConn(appConn, br), true, true), reply, nil
+}
+
+// checkHeaderSafe rejects a value that cannot be placed in the request line or
+// a header without changing the request's shape.
+func checkHeaderSafe(what, value string) error {
+	if strings.ContainsFunc(value, func(r rune) bool { return unicode.IsControl(r) }) {
+		return fmt.Errorf("transport: %s contains a control character", what)
+	}
+	return nil
 }
 
 // clientHelloID returns the uTLS fingerprint to mimic: the caller-selected
