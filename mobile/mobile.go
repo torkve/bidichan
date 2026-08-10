@@ -75,9 +75,13 @@ func (c *Client) SetLogger(l Logger) {
 
 // SetLinkObserver installs the connection-state sink. Call it before Start;
 // passing nil discards the notifications (the default).
-func (c *Client) SetLinkObserver(o LinkObserver) {
+//
+// The parameter is not named `o`: the Android binding generates C in which the
+// receiver is a local called `o`, and a parameter of that name collides with it
+// and fails to compile.
+func (c *Client) SetLinkObserver(observer LinkObserver) {
 	c.mu.Lock()
-	c.obs = o
+	c.obs = observer
 	c.mu.Unlock()
 }
 
