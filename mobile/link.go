@@ -4,7 +4,7 @@ package mobile
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 
 	"github.com/torkve/bidichan/internal/profilelink"
 )
@@ -28,7 +28,6 @@ type ProfileLink struct {
 	Hostname     string
 	Path         string
 	NoTlsBinding bool
-	Fingerprint  string
 	CaCertPem    string
 
 	EnableTun  bool
@@ -68,7 +67,6 @@ func (p *ProfileLink) Encode() (string, error) {
 		Host:               p.Hostname,
 		Path:               p.Path,
 		NoTLSBinding:       p.NoTlsBinding,
-		Fingerprint:        p.Fingerprint,
 		CACertPEM:          p.CaCertPem,
 		EnableTUN:          p.EnableTun,
 		TUNCIDR:            p.TunCidr,
@@ -80,8 +78,11 @@ func (p *ProfileLink) Encode() (string, error) {
 		PSKHex:             p.PskHex,
 	}
 	if p.ChannelsJson != "" {
+		// The raw decoder error names Go types and byte offsets, and this string
+		// is shown to whoever pressed Share. It cannot be their fault either —
+		// the client composed this JSON — so say what happened, not how.
 		if err := json.Unmarshal([]byte(p.ChannelsJson), &l.Channels); err != nil {
-			return "", fmt.Errorf("profile link: channels: %w", err)
+			return "", errors.New("profile link: the default channels could not be read")
 		}
 	}
 	return l.Encode()
@@ -100,7 +101,6 @@ func ParseProfileLink(raw string) (*ProfileLink, error) {
 		Hostname:           l.Host,
 		Path:               l.Path,
 		NoTlsBinding:       l.NoTLSBinding,
-		Fingerprint:        l.Fingerprint,
 		CaCertPem:          l.CACertPEM,
 		EnableTun:          l.EnableTUN,
 		TunCidr:            l.TUNCIDR,
@@ -114,7 +114,7 @@ func ParseProfileLink(raw string) (*ProfileLink, error) {
 	if len(l.Channels) > 0 {
 		b, err := json.Marshal(l.Channels)
 		if err != nil {
-			return nil, fmt.Errorf("profile link: channels: %w", err)
+			return nil, errors.New("profile link: the default channels could not be passed on")
 		}
 		out.ChannelsJson = string(b)
 	}

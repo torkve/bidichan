@@ -16,10 +16,13 @@ package profilelink
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -42,6 +45,21 @@ const (
 	// on connect, so an unbounded list is an unbounded amount of work asked of
 	// the device and the peer.
 	MaxChannels = 32
+
+	// The MTU bounds mirror channel.sanitizeTUNSpec, so a value that would be
+	// refused when the tunnel is set up is refused at import instead.
+	minTunMTU = 68
+	maxTunMTU = 16384 - 128
+
+	// These two the core does not bound anywhere: it applies whatever it is
+	// given. They are this layer's own policy, because a link arrives from
+	// someone else and an absurd figure should be refused while it can still be
+	// explained rather than becoming a profile that behaves strangely. The
+	// memory floor is roughly what the Go runtime needs to not spend its life
+	// collecting.
+	minMemoryMB  = 16
+	maxMemoryMB  = 512
+	maxGraceSecs = 3600
 )
 
 // Link is everything needed to recreate a profile elsewhere. It deliberately
@@ -52,38 +70,41 @@ type Link struct {
 	Name    string `json:"name"`
 	Addr    string `json:"addr"`
 	Host    string `json:"host"`
-	Path    string `json:"path,omitempty"`
+	Path    string `json:"path"`
 
 	NoTLSBinding bool   `json:"noBind"`
-	Fingerprint  string `json:"fp,omitempty"`
-	CACertPEM    string `json:"ca,omitempty"`
+	CACertPEM    string `json:"ca"`
 
 	EnableTUN  bool   `json:"tun"`
-	TUNCIDR    string `json:"cidr,omitempty"`
-	TUNCIDR6   string `json:"cidr6,omitempty"`
-	TUNMTU     int    `json:"mtu,omitempty"`
+	TUNCIDR    string `json:"cidr"`
+	TUNCIDR6   string `json:"cidr6"`
+	TUNMTU     int    `json:"mtu"`
 	FullTunnel bool   `json:"full"`
 
-	MemoryLimitMB      int `json:"mem,omitempty"`
-	ResumeGraceSeconds int `json:"grace,omitempty"`
+	MemoryLimitMB      int `json:"mem"`
+	ResumeGraceSeconds int `json:"grace"`
 
-	Channels []Channel `json:"chans,omitempty"`
+	Channels []Channel `json:"chans"`
 
 	// PSKHex is the pre-shared key, and is optional. A link that carries it is
 	// a credential: anyone holding the link can use the tunnel. Nothing here
 	// protects it — the encoding is reversible by design — so a sender should
 	// be asked before it is included, and a receiver told when it is present.
-	PSKHex string `json:"psk,omitempty"`
+	PSKHex string `json:"psk"`
 }
 
 // Channel mirrors the channel both clients configure. The field names are the
 // ones both already persist, so a link is readable by either.
+// Every field is emitted even when empty, deliberately: a client whose decoder
+// requires each key — Swift's synthesized one does — silently decodes nothing
+// when a key it expects is missing, and an absent "target" on a proxy channel
+// would cost the importer every channel in the link.
 type Channel struct {
-	Label         string `json:"label,omitempty"`
+	Label         string `json:"label"`
 	Kind          string `json:"kind"`
 	AllInterfaces bool   `json:"allInterfaces"`
 	Port          int    `json:"port"`
-	Target        string `json:"target,omitempty"`
+	Target        string `json:"target"`
 	RouteSystem   bool   `json:"routeSystem"`
 }
 
@@ -108,11 +129,25 @@ func (l *Link) Encode() (string, error) {
 	if err := c.validate(); err != nil {
 		return "", err
 	}
+	// An empty list, never null. Both clients build this list themselves — iOS
+	// sends "[]" for a profile with no channels, Android sends nothing at all —
+	// so without this the same profile would encode to two different payloads
+	// depending on which device shared it.
+	if c.Channels == nil {
+		c.Channels = []Channel{}
+	}
 	payload, err := json.Marshal(&c)
 	if err != nil {
 		return "", fmt.Errorf("profile link: %w", err)
 	}
-	return Scheme + "://" + Host + "#" + base64.RawURLEncoding.EncodeToString(payload), nil
+	link := Scheme + "://" + Host + "#" + base64.RawURLEncoding.EncodeToString(payload)
+	// The same limit Parse applies, checked here so the refusal lands on the
+	// device that can still do something about it. A pasted CA bundle is the
+	// way to reach it: nothing else here is unbounded.
+	if len(link) > MaxBytes {
+		return "", fmt.Errorf("profile link: too large (%d bytes, limit %d)", len(link), MaxBytes)
+	}
+	return link, nil
 }
 
 // Parse reads a link produced by Encode, on this or any other client.
@@ -139,22 +174,20 @@ func Parse(raw string) (*Link, error) {
 	if err := json.Unmarshal(payload, &l); err != nil {
 		return nil, errors.New("profile link: damaged (unreadable contents)")
 	}
-	if l.Version != Version {
+	if l.Version < 1 {
+		return nil, errors.New("profile link: damaged (no format version)")
+	}
+	// Older links stay readable — that is what a version is for. Only a format
+	// from the future is refused, because we cannot know what it means.
+	if l.Version > Version {
 		return nil, fmt.Errorf(
-			"profile link: made by a %s version of the app (format %d, this one reads %d)",
-			newerOrOlder(l.Version), l.Version, Version)
+			"profile link: made by a newer version of the app (format %d, this one reads %d)",
+			l.Version, Version)
 	}
 	if err := l.validate(); err != nil {
 		return nil, err
 	}
 	return &l, nil
-}
-
-func newerOrOlder(v int) string {
-	if v > Version {
-		return "newer"
-	}
-	return "older"
 }
 
 // validate rejects a link that would produce a profile which cannot connect,
@@ -171,22 +204,84 @@ func (l *Link) validate() error {
 	if l.Host == "" {
 		return errors.New("profile link: no hostname")
 	}
-	if !strings.Contains(l.Addr, ":") {
-		return fmt.Errorf("profile link: server address %q has no port", l.Addr)
-	}
+	// Character checks first, so a poisoned value is reported as what it is
+	// rather than as whatever it happens to also fail.
+	//
 	// The transport composes the upgrade request by hand, so a control
 	// character in any of these would let whoever wrote the link decide what
-	// request the importing device sends — to a host they also chose.
-	for _, f := range []struct{ what, value string }{
-		{"server address", l.Addr},
-		{"hostname", l.Host},
-		{"path", l.Path},
-		{"fingerprint", l.Fingerprint},
-		{"name", l.Name},
+	// request the importing device sends — to a host they also chose. A space
+	// is not a control character but is just as unwelcome in the three that end
+	// up in the request: it ends the target in the request line, and makes a
+	// header malformed. None of these can legitimately contain either.
+	for _, f := range []struct {
+		what      string
+		value     string
+		inRequest bool
+	}{
+		{"server address", l.Addr, true},
+		{"hostname", l.Host, true},
+		{"path", l.Path, true},
+		{"name", l.Name, false},
 	} {
 		if hasControl(f.value) {
 			return fmt.Errorf("profile link: %s contains a control character", f.what)
 		}
+		if f.inRequest && strings.Contains(f.value, " ") {
+			return fmt.Errorf("profile link: %s %q contains a space", f.what, f.value)
+		}
+	}
+	if err := checkHostPort("server address", l.Addr, true); err != nil {
+		return err
+	}
+	// Anything not rooted at / is either a broken request or an absolute-form
+	// one, which a reverse proxy may route somewhere other than the origin the
+	// importer thinks they are getting.
+	if l.Path != "" && !strings.HasPrefix(l.Path, "/") {
+		return fmt.Errorf("profile link: path %q does not start with /", l.Path)
+	}
+	// Values that would be refused, or would simply behave oddly, once the
+	// profile is used. Catching them here means a link is rejected while it can
+	// still be explained, rather than becoming a profile that fails later.
+	if l.PSKHex != "" {
+		if _, err := hex.DecodeString(l.PSKHex); err != nil {
+			return errors.New("profile link: the key is not valid hex")
+		}
+	}
+	if l.TUNMTU != 0 && (l.TUNMTU < minTunMTU || l.TUNMTU > maxTunMTU) {
+		return fmt.Errorf("profile link: MTU %d is outside %d-%d", l.TUNMTU, minTunMTU, maxTunMTU)
+	}
+	// The same rules channel.sanitizeTUNSpec applies, and for the same reason:
+	// ParseCIDR survives values that are unusable as a point-to-point address,
+	// and an IPv4 address in the IPv6 field is the copy-paste this catches.
+	for _, c := range []struct {
+		what  string
+		value string
+		v6    bool
+	}{
+		{"address", l.TUNCIDR, false},
+		{"IPv6 address", l.TUNCIDR6, true},
+	} {
+		if c.value == "" {
+			continue
+		}
+		ip, _, err := net.ParseCIDR(c.value)
+		if err != nil {
+			return fmt.Errorf("profile link: tunnel %s %q is not a CIDR", c.what, c.value)
+		}
+		if c.v6 && ip.To4() != nil {
+			return fmt.Errorf("profile link: tunnel %s %q is an IPv4 address", c.what, c.value)
+		}
+		if ip.IsUnspecified() || ip.IsMulticast() {
+			return fmt.Errorf("profile link: tunnel %s %q cannot be assigned to a device", c.what, c.value)
+		}
+	}
+	if l.MemoryLimitMB != 0 && (l.MemoryLimitMB < minMemoryMB || l.MemoryLimitMB > maxMemoryMB) {
+		return fmt.Errorf("profile link: memory limit %d MB is outside %d-%d",
+			l.MemoryLimitMB, minMemoryMB, maxMemoryMB)
+	}
+	if l.ResumeGraceSeconds < 0 || l.ResumeGraceSeconds > maxGraceSecs {
+		return fmt.Errorf("profile link: reconnect window %ds is outside 0-%d",
+			l.ResumeGraceSeconds, maxGraceSecs)
 	}
 	if len(l.Channels) > MaxChannels {
 		return fmt.Errorf("profile link: %d channels, limit %d", len(l.Channels), MaxChannels)
@@ -201,9 +296,31 @@ func (l *Link) validate() error {
 		if c.Port < 1 || c.Port > 65535 {
 			return fmt.Errorf("profile link: channel %d has an invalid port %d", i+1, c.Port)
 		}
-		if (c.Kind == "forwardLocal" || c.Kind == "forwardRemote") && !strings.Contains(c.Target, ":") {
-			return fmt.Errorf("profile link: channel %d forwards to %q, which has no port", i+1, c.Target)
+		// A forward's target is dialed on whichever side opens it (see
+		// daemon.ctrlOpenForward), with nothing between here and the dial, so
+		// it gets the same treatment as the server address. An empty host is
+		// allowed — ":80" means the loopback of the far side.
+		if c.Kind == "forwardLocal" || c.Kind == "forwardRemote" {
+			if err := checkHostPort(fmt.Sprintf("channel %d target", i+1), c.Target, false); err != nil {
+				return err
+			}
 		}
+	}
+	return nil
+}
+
+// checkHostPort rejects anything that is not a dialable host:port. requireHost
+// is false where an empty host is meaningful, as it is for a forward target.
+func checkHostPort(what, value string, requireHost bool) error {
+	host, port, err := net.SplitHostPort(value)
+	if err != nil {
+		return fmt.Errorf("profile link: %s %q is not host:port", what, value)
+	}
+	if requireHost && host == "" {
+		return fmt.Errorf("profile link: %s %q has no host", what, value)
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("profile link: %s %q has no usable port", what, value)
 	}
 	return nil
 }

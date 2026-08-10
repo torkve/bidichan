@@ -38,6 +38,35 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: build the mobile bindings
+        # ./mobile is behind `//go:build ios || android`, so the untagged
+        # build, vet and test steps above never compile a line of it. That
+        # matters most for the types it mirrors from internal packages: a
+        # field renamed or removed in the core leaves everything above green
+        # and breaks only the gomobile build, on the clients' CI. These steps
+        # are cheap and close that gap.
+        #
+        # No -tags: GOOS=ios and GOOS=android are what `//go:build ios ||
+        # android` keys on. CGO stays off — this is a compile check, not a
+        # bind, and there is no cross C toolchain on the runner.
+        #
+        # 32-bit as well as 64-bit, because `gomobile bind -target=android`
+        # passes no ABI list and so builds arm and 386 too. An int that only
+        # overflows on a 32-bit word would otherwise be found on the client's
+        # CI, which is the failure this step exists to prevent.
+        run: |
+          GOOS=ios GOARCH=arm64 CGO_ENABLED=0 go build ./mobile/
+          GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build ./mobile/
+          GOOS=android GOARCH=arm CGO_ENABLED=0 go build ./mobile/
+
+      - name: vet the mobile bindings
+        # go vet above is untagged too, so ./mobile has never been vetted.
+        # Android only: vet links a test binary, and GOOS=ios cannot without
+        # cgo, which needs a C toolchain we do not have here. Every file in
+        # the package is `ios || android` except tun.go and tun_android.go, so
+        # this covers all but the one iOS-only file.
+        run: GOOS=android GOARCH=arm64 CGO_ENABLED=0 go vet ./mobile/
+
       - name: Pre-pull nginx:alpine
         # TestNginxDockerFront launches a container — pulling the image
         # inline would land in the test's slow path and could race with
