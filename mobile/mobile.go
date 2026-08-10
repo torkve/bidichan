@@ -31,7 +31,7 @@ import (
 // transport underneath resumes the same session, so the peer, its channels and
 // the connections inside them survive the outage. Only when the session cannot
 // be resumed at all does the client build a new one, and it keeps trying until
-// Stop is called — so Wait returns on shutdown, not on every flap. The host
+// Stop is called — so AwaitDone returns on shutdown, not on every flap. The host
 // follows what is happening through LinkObserver.
 type Client struct {
 	mu     sync.Mutex
@@ -311,17 +311,20 @@ func (c *Client) supervise(ctx context.Context, dcfg daemon.Config, done chan st
 	}
 }
 
-// setRunErr records why the client stopped, for Wait to report.
+// setRunErr records why the client stopped, for AwaitDone to report.
 func (c *Client) setRunErr(err error) {
 	c.mu.Lock()
 	c.runErr = err
 	c.mu.Unlock()
 }
 
-// Wait blocks until the client stops for good and returns the reason, if any.
-// The host calls this on a background thread and tears its tunnel down when it
-// returns.
-func (c *Client) Wait() error {
+// AwaitDone blocks until the client stops for good and returns the reason, if
+// any. The host calls this on a background thread and tears its tunnel down
+// when it returns.
+//
+// Not named Wait: the Android binding turns it into a Java method, and `wait`
+// is already taken by java.lang.Object, where it is final.
+func (c *Client) AwaitDone() error {
 	c.mu.Lock()
 	done := c.done
 	c.mu.Unlock()
