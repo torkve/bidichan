@@ -65,10 +65,16 @@ func Execute(args []string) int {
 	return 0
 }
 
+// version is stamped at build time; see the Makefile and the Dockerfile, which
+// carry the same -X flag. A build that does not set it says so rather than
+// claiming a number it has no right to.
+var version = "dev"
+
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:   "bidichan",
-		Short: "Reliable bidirectional transport over TLS + WebSocket",
+		Use:     "bidichan",
+		Version: version,
+		Short:   "Reliable bidirectional transport over TLS + WebSocket",
 		Long: `bidichan establishes a long-lived peer link over a TLS WebSocket,
 authenticated by a pre-shared key.  After authentication both peers are
 equal: either side can open or close channels (port-forwarding, HTTP/
@@ -110,6 +116,7 @@ func newListenCmd() *cobra.Command {
 		allowShell   bool
 		noResume     bool
 		resumeGrace  time.Duration
+		tuning       tuningDef
 	)
 	cmd := &cobra.Command{
 		Use:   "listen [<profile>]",
@@ -168,7 +175,7 @@ or /etc/bidichan/<name>.conf.`,
 				network = "unix"
 			}
 
-			d, err := daemon.New(daemon.Config{
+			cfg := daemon.Config{
 				Mode:             daemon.ModeListen,
 				BindAddr:         bindAddr,
 				Hostname:         hostname,
@@ -183,7 +190,11 @@ or /etc/bidichan/<name>.conf.`,
 				ResumeGrace:      resumeGrace,
 				ControlSocket:    sock,
 				Logger:           logger,
-			})
+			}
+			if err := tuning.apply(&cfg); err != nil {
+				return err
+			}
+			d, err := daemon.New(cfg)
 			if err != nil {
 				return err
 			}
@@ -204,6 +215,7 @@ or /etc/bidichan/<name>.conf.`,
 	f.BoolVar(&allowShell, "allow-shell", false, "allow the peer to open an interactive shell on this host (grants the peer RCE)")
 	f.BoolVar(&noResume, "no-resume", false, "do not hold a peer's session open for it to reconnect to; every connection dies with its network")
 	f.DurationVar(&resumeGrace, "resume-grace", 0, "how long to hold a session for a client that lost its network (default 90s)")
+	tuning.register(f)
 	f.StringVar(&sock, "socket", "", "local CLI control socket path (default $XDG_RUNTIME_DIR/bidichan-<pid>.sock)")
 
 	_ = cmd.RegisterFlagCompletionFunc("config", profileFlagCompletion)
@@ -228,6 +240,7 @@ func newConnectCmd() *cobra.Command {
 		allowShell  bool
 		noResume    bool
 		resumeGrace time.Duration
+		tuning      tuningDef
 	)
 	cmd := &cobra.Command{
 		Use:   "connect [<profile>] [-- <command>...]",
@@ -331,6 +344,9 @@ command's status and tears the tunnel down.`,
 				ControlSocket:    sock,
 				Logger:           logger,
 			}
+			if err := tuning.apply(&cfg); err != nil {
+				return err
+			}
 			if len(command) == 0 {
 				d, err := daemon.New(cfg)
 				if err != nil {
@@ -360,6 +376,7 @@ command's status and tears the tunnel down.`,
 	f.BoolVar(&allowShell, "allow-shell", false, "allow the peer to open an interactive shell on this host (grants the peer RCE)")
 	f.BoolVar(&noResume, "no-resume", false, "do not resume the session over a new connection when the network drops; the peer dies with it")
 	f.DurationVar(&resumeGrace, "resume-grace", 0, "how long the network may be gone before the session is given up (default 90s)")
+	tuning.register(f)
 	f.StringVar(&sock, "socket", "", "local CLI control socket path")
 
 	_ = cmd.RegisterFlagCompletionFunc("config", profileFlagCompletion)

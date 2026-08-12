@@ -9,3 +9,4 @@
 *.sock
 .idea/
 .vscode/
+/dist/bidichan-linux-*

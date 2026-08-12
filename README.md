@@ -39,14 +39,25 @@ outside there is only an HTTPS server.
 The repository is a plain Go module. Requires Go 1.25+.
 
 ```sh
-go build ./...
+make build          # a stripped `bidichan` in the module root
+make test           # go test -race ./...
 ```
 
-A `bidichan` binary is produced in the module root. Tests:
+`make build` is the one to use. A plain `go build ./...` also works, but leaves
+the symbol table and debug information in place — about a third of the binary,
+and no use on the far end — and, on a machine with a C toolchain, links against
+the host libc. The Makefile turns cgo off, so what it produces is static and
+runs on whatever the target happens to be.
+
+Cross-compiling for a small Linux controller:
 
 ```sh
-go test -race ./...
+make dist           # dist/bidichan-linux-{arm64,armv7,amd64}
 ```
+
+That is roughly 7.5 MB for arm64 and 7.9 MB for armv7, against 11.7 MB for an
+unstripped build. For what to do about memory on such a box, see
+[Running on a small box](#running-on-a-small-box).
 
 ## Quick start
 
@@ -440,6 +451,47 @@ default is a reasonable trade for a handful of peers.
   connection that dies with its network.
 - The wire still looks like the same HTTPS WebSocket service: one extra cookie
   going out, one extra `Set-Cookie` coming back.
+
+## Running on a small box
+
+The defaults are sized for a phone on a mobile network, where the
+bandwidth-delay product is large and memory is somebody else's problem. A
+controller with a few tens of megabytes wants the opposite trade, and three
+flags make it, on both `listen` and `connect`:
+
+| flag | default | what it costs to lower |
+|---|---|---|
+| `--memory-limit` | none | a soft cap on total memory, in MiB. Below ~32 MiB you buy collector effort, not smaller residency |
+| `--resume-buffer` | `4m` | the per-session send buffer, and with it sustained throughput, which is about this divided by the round trip time |
+| `--stream-window` | `1m` | the receive window held per open stream. 256 KiB is the floor the protocol allows |
+
+Sizes take a `k`/`m`/`g` suffix, or a plain byte count. All three are also
+config-file keys, which is the tidier place for them — a profile describes a
+deployment, and this is part of one:
+
+```ini
+# /etc/bidichan/gateway.conf — a small box acting as both ends
+addr          = gate.example.com:443
+hostname      = gate.example.com
+psk-file      = ./gateway.psk
+memory-limit  = 48
+resume-buffer = 512k
+stream-window = 256k
+```
+
+`512k` over a 50 ms round trip is still about 80 Mbit/s, which is more than
+such a box is usually asked for. Both buffer settings are local to the end that
+sets them: the two sides need not agree, so a controller can hold small buffers
+while the phone at the other end keeps its large ones.
+
+For reference, a server on amd64 sits at about 7.4 MB resident when idle and
+9 MB with a peer connected, of which the binary's own pages are the larger
+part — which is why a stripped build (see [Build](#build)) is the first thing
+to do, not the last. Under sustained transfer the defaults reach roughly 15 MB;
+the settings above hold that down.
+
+`--memory-limit` is `GOMEMLIMIT` by another name, so the environment variable
+works too, and pairs sensibly with a systemd `MemoryMax=` as a hard backstop.
 
 ## Multiple peers
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,9 @@ type profileValues struct {
 	AllowShell   *bool
 	NoResume     *bool
 	ResumeGrace  *string
+	MemoryLimit  *string
+	ResumeBuffer *string
+	StreamWindow *string
 }
 
 // loadProfile resolves a profile source — either an explicit path passed
@@ -240,8 +244,25 @@ func applyKey(out *profileValues, key, val string) error {
 			return fmt.Errorf("resume-grace: %w", err)
 		}
 		out.ResumeGrace = strPtr(val)
+	// Validated here as well as at the flag, because applyProfile discards
+	// what Set returns: a bad value in a file would otherwise pass silently.
+	case "memory-limit":
+		if _, err := strconv.Atoi(val); err != nil {
+			return fmt.Errorf("memory-limit: %q is not a number of MiB", val)
+		}
+		out.MemoryLimit = strPtr(val)
+	case "resume-buffer":
+		if _, err := parseSize(val); err != nil {
+			return fmt.Errorf("resume-buffer: %w", err)
+		}
+		out.ResumeBuffer = strPtr(val)
+	case "stream-window":
+		if _, err := parseSize(val); err != nil {
+			return fmt.Errorf("stream-window: %w", err)
+		}
+		out.StreamWindow = strPtr(val)
 	default:
-		return fmt.Errorf("unknown key %q (known keys: addr, unix-socket, hostname, psk, psk-file, no-tls-binding, cert, key, socket, decoy-backend, path, cacert, channel, allow-shell, no-resume, resume-grace)", key)
+		return fmt.Errorf("unknown key %q (known keys: addr, unix-socket, hostname, psk, psk-file, no-tls-binding, cert, key, socket, decoy-backend, path, cacert, channel, allow-shell, no-resume, resume-grace, memory-limit, resume-buffer, stream-window)", key)
 	}
 	return nil
 }
@@ -385,6 +406,15 @@ func applyProfile(fs *pflag.FlagSet, source string, logger *log.Logger) (string,
 	}
 	if v.ResumeGrace != nil {
 		set("resume-grace", *v.ResumeGrace)
+	}
+	if v.MemoryLimit != nil {
+		set("memory-limit", *v.MemoryLimit)
+	}
+	if v.ResumeBuffer != nil {
+		set("resume-buffer", *v.ResumeBuffer)
+	}
+	if v.StreamWindow != nil {
+		set("stream-window", *v.StreamWindow)
 	}
 	return path, nil
 }

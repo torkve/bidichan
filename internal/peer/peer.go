@@ -122,9 +122,50 @@ type resumableConn interface {
 	ResumeGrace() time.Duration
 }
 
-func NewPeer(role Role, conn net.Conn, id string, logger *log.Logger) (*Peer, error) {
+// MinStreamWindow is the smallest per-stream receive window yamux will accept.
+// It mirrors yamux's own unexported initialStreamWindow, which VerifyConfig
+// refuses to go below. Repeated here so a caller can be told at configuration
+// time rather than discovering it when the first peer is turned away; yamux
+// stays the backstop.
+const MinStreamWindow uint32 = 256 << 10
+
+// DefaultStreamWindow is what a peer uses when nothing says otherwise: room
+// for a phone on a mobile network, where the bandwidth-delay product is large
+// enough that a smaller window would leave the link waiting for credit.
+const DefaultStreamWindow uint32 = 1 << 20
+
+// Option adjusts a peer as it is built. Variadic because almost every caller
+// wants the defaults and should not have to say so.
+type Option func(*peerOptions)
+
+type peerOptions struct {
+	maxStreamWindow uint32
+}
+
+// WithMaxStreamWindow caps the per-stream receive window. Smaller trades
+// throughput on a long fat path for memory that is otherwise held per open
+// stream, which is the trade a small box wants. Below MinStreamWindow is
+// raised to it rather than refused: this is a memory ceiling, and a caller
+// asking for less than the protocol allows means "as little as possible".
+func WithMaxStreamWindow(n uint32) Option {
+	return func(o *peerOptions) {
+		if n == 0 {
+			return
+		}
+		if n < MinStreamWindow {
+			n = MinStreamWindow
+		}
+		o.maxStreamWindow = n
+	}
+}
+
+func NewPeer(role Role, conn net.Conn, id string, logger *log.Logger, opts ...Option) (*Peer, error) {
 	if logger == nil {
 		logger = log.Default()
+	}
+	o := peerOptions{maxStreamWindow: DefaultStreamWindow}
+	for _, apply := range opts {
+		apply(&o)
 	}
 	yc := yamux.DefaultConfig()
 	yc.LogOutput = nil
@@ -135,7 +176,7 @@ func NewPeer(role Role, conn net.Conn, id string, logger *log.Logger) (*Peer, er
 	// fixed 30s beat a traffic analyser could lock onto.
 	yc.KeepAliveInterval = jitter(30*time.Second, 10*time.Second)
 	yc.ConnectionWriteTimeout = 30 * time.Second
-	yc.MaxStreamWindowSize = 1 << 20 // 1 MiB per stream
+	yc.MaxStreamWindowSize = o.maxStreamWindow
 
 	// A resumable transport deliberately stalls instead of failing while the
 	// network is away, and the connection itself reports how long it will do

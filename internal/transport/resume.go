@@ -118,6 +118,20 @@ const (
 	DefaultResumeIdle      = 75 * time.Second
 )
 
+// MinResumeBuffer is the smallest send buffer worth configuring.
+//
+// Nothing smaller is incorrect: an oversized write is admitted when the buffer
+// is empty, acks are never gated on buffer room, and a session resumes
+// byte-exactly at any size. It is throughput that falls off a cliff. The
+// receiver volunteers an ack once resumeAckThreshold bytes are outstanding, so
+// a buffer too small to hold that many never provokes one, and drainage falls
+// back to the counters riding on the keepalive — a few kilobytes per interval.
+// Two thresholds leaves the mechanism room to work rather than merely to exist.
+//
+// Note also that this doubles as the session's send window: sustained
+// throughput is about MaxBuffer/RTT, which is what to size against.
+const MinResumeBuffer = 2 * resumeAckThreshold
+
 // ResumeConfig tunes a Session. The zero value is filled in with the defaults
 // above.
 type ResumeConfig struct {

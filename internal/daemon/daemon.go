@@ -144,6 +144,18 @@ type Config struct {
 	// declared lost. Zero uses the transport default.
 	ResumeGrace time.Duration
 
+	// ResumeBuffer caps the unacknowledged send buffer held per session, and
+	// with it sustained throughput, which is roughly this divided by the round
+	// trip time. Zero uses the transport default. Lowering it is how a box
+	// with little memory buys some back — see transport.MinResumeBuffer for
+	// how far down is still worth doing.
+	ResumeBuffer int
+
+	// StreamWindow caps the receive window held per open stream. Zero uses the
+	// peer default. Entirely local: the two ends need not agree, so a small
+	// box can hold a small window while its peer keeps a large one.
+	StreamWindow uint32
+
 	// OnLinkState, if set (connect side), reports transport link transitions
 	// while the peer stays up, so a host can show "reconnecting" instead of
 	// tearing its tunnel down.
@@ -240,7 +252,7 @@ func (d *Daemon) runListen(ctx context.Context) error {
 		DecoyBackend:  d.cfg.DecoyBackend,
 		Path:          d.cfg.Path,
 		DisableResume: d.cfg.DisableResume,
-		ResumeConfig:  transport.ResumeConfig{Grace: d.cfg.ResumeGrace},
+		ResumeConfig:  transport.ResumeConfig{Grace: d.cfg.ResumeGrace, MaxBuffer: d.cfg.ResumeBuffer},
 	})
 	if err != nil {
 		return err
@@ -299,8 +311,9 @@ func (d *Daemon) runConnect(ctx context.Context) error {
 		Path:        d.cfg.Path,
 		HelloID:     d.cfg.HelloID,
 		ResumeConfig: transport.ResumeConfig{
-			Grace:  d.cfg.ResumeGrace,
-			Logger: d.logger,
+			Grace:     d.cfg.ResumeGrace,
+			MaxBuffer: d.cfg.ResumeBuffer,
+			Logger:    d.logger,
 		},
 		OnLinkState: d.cfg.OnLinkState,
 		Control:     d.cfg.DialControl,
@@ -363,7 +376,7 @@ func (d *Daemon) trackAdoption() bool {
 
 func (d *Daemon) adoptPeer(ctx context.Context, conn net.Conn, role peer.Role) (*peer.Peer, error) {
 	id, _ := randomID()
-	p, err := peer.NewPeer(role, conn, id, d.logger)
+	p, err := peer.NewPeer(role, conn, id, d.logger, peer.WithMaxStreamWindow(d.cfg.StreamWindow))
 	if err != nil {
 		return nil, err
 	}
