@@ -9,4 +9,6 @@
 *.sock
 .idea/
 .vscode/
-/dist/bidichan-linux-*
+# Build artefacts. A binary was tracked here once by accident; the whole
+# directory is ignored so it cannot happen again.
+/dist/

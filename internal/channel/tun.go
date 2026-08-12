@@ -320,4 +320,3 @@ func (r *tunRunner) attachStream(s net.Conn) error {
 	_ = r.Close()
 	return nil
 }
-

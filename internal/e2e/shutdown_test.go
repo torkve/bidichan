@@ -170,5 +170,3 @@ func TestBinaryStopsOnSIGINT(t *testing.T) {
 		t.Fatal("binary did not exit within 5s of SIGINT")
 	}
 }
-
-
