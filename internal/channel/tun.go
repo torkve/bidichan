@@ -148,11 +148,25 @@ type tunRunner struct {
 func (r *tunRunner) Close() error {
 	r.closeOn.Do(func() {
 		close(r.closed)
-		if r.ifce != nil {
-			_ = r.ifce.Close()
+		// Read under the lock attachStream writes it under. A net.Conn is two
+		// words, and Close runs on peer goroutines with no relationship to
+		// whichever one is attaching: an unsynchronised read can pair the new
+		// type word with the old nil data word, and the call below then
+		// dispatches onto a nil receiver. That faults inside the runtime, which
+		// becomes a fatal error and a re-raised signal — on whatever thread was
+		// running, including one that entered from the host. Anonymous,
+		// unreproducible, and entirely avoidable.
+		//
+		// Snapshotted rather than held, so a Close that blocks does not block
+		// with the mutex taken.
+		r.mu.Lock()
+		ifce, stream := r.ifce, r.stream
+		r.mu.Unlock()
+		if ifce != nil {
+			_ = ifce.Close()
 		}
-		if r.stream != nil {
-			_ = r.stream.Close()
+		if stream != nil {
+			_ = stream.Close()
 		}
 	})
 	return nil
@@ -233,6 +247,18 @@ func (r *tunRunner) openAndPump(ctx context.Context, p *peer.Peer, chID uint64) 
 
 func (r *tunRunner) attachStream(s net.Conn) error {
 	r.mu.Lock()
+	// A runner that has already been closed must not take a stream. Close has
+	// been and gone, so the pumps started below would own something nothing
+	// will ever close: the reader parks in ReadFull until the whole session
+	// dies, and the stream leaks with it. Checked here, under the same lock
+	// that publishes the stream, so the decision cannot race the closing.
+	select {
+	case <-r.closed:
+		r.mu.Unlock()
+		_ = s.Close()
+		return errors.New("tun: the channel is already closed")
+	default:
+	}
 	if r.stream != nil {
 		r.mu.Unlock()
 		_ = s.Close()
