@@ -148,17 +148,18 @@ type tunRunner struct {
 func (r *tunRunner) Close() error {
 	r.closeOn.Do(func() {
 		close(r.closed)
-		// Read under the lock attachStream writes it under. A net.Conn is two
-		// words, and Close runs on peer goroutines with no relationship to
-		// whichever one is attaching: an unsynchronised read can pair the new
-		// type word with the old nil data word, and the call below then
-		// dispatches onto a nil receiver. That faults inside the runtime, which
-		// becomes a fatal error and a re-raised signal — on whatever thread was
-		// running, including one that entered from the host. Anonymous,
-		// unreproducible, and entirely avoidable.
+		// r.stream is published under r.mu, so it is read under r.mu: an
+		// interface value is two words, and reading one unsynchronised can pair
+		// a new type word with a stale data word.
 		//
-		// Snapshotted rather than held, so a Close that blocks does not block
-		// with the mutex taken.
+		// The close above must stay above this: attachStream tests r.closed
+		// while holding the same lock, so closing the channel first is what
+		// guarantees that either it sees the runner closed and refuses, or this
+		// snapshot sees its stream. Moving it below the Lock reopens the window
+		// where a stream is published and nobody closes it.
+		//
+		// Snapshotted rather than held, because ifce.Close can call out to the
+		// host and must not do so with the mutex taken.
 		r.mu.Lock()
 		ifce, stream := r.ifce, r.stream
 		r.mu.Unlock()
