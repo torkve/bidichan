@@ -27,9 +27,10 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # '1.25' resolves to the latest 1.25.x patch, which is what we
-          # want — pinning a patch would silently miss stdlib CVEs.
-          go-version: '1.25'
+          # '1.26' resolves to the latest 1.26.x patch, which is what we
+          # want — pinning a patch would silently miss stdlib CVEs. The major
+          # is a floor, not a preference: see the Build section of the README.
+          go-version: '1.26'
           cache: true
 
       - name: go build
@@ -90,7 +91,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.26'
           cache: true
 
       - name: Install govulncheck

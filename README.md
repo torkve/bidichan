@@ -36,7 +36,14 @@ outside there is only an HTTPS server.
 
 ## Build
 
-The repository is a plain Go module. Requires Go 1.25+.
+The repository is a plain Go module. Requires Go 1.26+.
+
+The floor is 1.26 rather than 1.25 because of the mobile bindings: cgo before
+1.26 emitted the exported-function argument struct without an alignment
+attribute, so on arm64 the C caller could place it 4-byte aligned and Go's
+write barrier would abort the process mid-GC (golang/go#46893). Nothing in the
+CLI is affected — it uses no cgo exports — but one toolchain floor for the
+module is simpler than a second one for the bindings.
 
 ```sh
 make build          # a stripped `bidichan` in the module root

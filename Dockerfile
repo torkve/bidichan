@@ -3,7 +3,7 @@
 # ---- Build ----
 # Pinned to 1.25-alpine so the build is reproducible. Bump in lockstep with
 # go.mod when the toolchain in go.mod moves.
-FROM golang:1.25-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 
 # Cache module downloads in their own layer so editing source code doesn't
