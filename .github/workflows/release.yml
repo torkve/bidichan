@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # The Makefile derives VERSION from `git describe --tags`. The
           # default shallow, single-commit fetch has no tag objects, so that
@@ -40,7 +40,7 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           # Same floor as tests.yml: '1.26' tracks the latest patch rather
           # than pinning one and missing stdlib CVEs.
@@ -99,7 +99,7 @@ jobs:
       - name: Upload workflow artefacts
         # Runs for tags too: the assets stay retrievable from the run even
         # if the release step fails.
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bidichan-${{ steps.version.outputs.version }}
           if-no-files-found: error
