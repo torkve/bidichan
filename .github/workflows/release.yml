@@ -1,0 +1,143 @@
+name: release
+
+# Publishes the cross-built artefacts for a tag: static Linux binaries and
+# the Keenetic opkg package. Tests are not repeated here — `tests.yml` runs
+# on every push, tag pushes included, so a tagged commit is already covered.
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual runs build and upload the same artefacts as workflow artefacts
+  # (no GitHub release), which is how to check a packaging change without
+  # burning a tag.
+  workflow_dispatch:
+
+permissions:
+  # Creating the release and uploading assets needs write; the default
+  # read-only token cannot.
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Deliberately NOT cancel-in-progress: interrupting a run mid-upload
+  # would leave a release with only some of its assets attached.
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: cross-build + publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The Makefile derives VERSION from `git describe --tags`. The
+          # default shallow, single-commit fetch has no tag objects, so that
+          # would silently degrade to a bare short SHA — and the .ipk would
+          # carry it as its package version. Full history keeps describe
+          # honest, and lets a manual run name itself sensibly too.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Same floor as tests.yml: '1.26' tracks the latest patch rather
+          # than pinning one and missing stdlib CVEs.
+          go-version: '1.26'
+          cache: true
+
+      - name: Resolve version
+        id: version
+        # On a tag, the tag name IS the version — take it directly rather
+        # than trusting describe to reproduce it. Manual runs fall back to
+        # describe so their artefacts are still identifiable.
+        #
+        # Ref names reach the shell through env, never interpolated into the
+        # script body: a tag is attacker-shaped input in the general case,
+        # and `${{ }}` inside `run:` is textual substitution, so a crafted
+        # name would execute here.
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if [ "$REF_TYPE" = tag ]; then
+            version="$REF_NAME"
+          else
+            version="$(git describe --tags --always --dirty)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "building $version"
+
+      - name: Cross-build Linux binaries
+        # `dist` is exactly the release set: amd64, arm64 and armv7. Keeping
+        # it as one target means the Makefile stays the single source of
+        # truth for which architectures ship.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: make VERSION="$VERSION" dist
+
+      - name: Build the Keenetic opkg package
+        # Produces dist/bidichan_<version>_mipsel-3.4.ipk — GOARCH=mipsle
+        # GOMIPS=softfloat, assembled with ar/tar (no opkg-utils needed).
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: make VERSION="$VERSION" keenetic
+
+      - name: Checksums and manifest
+        run: |
+          set -eu
+          cd dist
+          sha256sum bidichan-linux-amd64 bidichan-linux-arm64 \
+                    bidichan-linux-armv7 bidichan_*.ipk \
+            | tee SHA256SUMS
+          echo
+          file bidichan-linux-amd64 bidichan-linux-arm64 bidichan-linux-armv7
+          ls -lh bidichan-linux-* bidichan_*.ipk
+
+      - name: Upload workflow artefacts
+        # Runs for tags too: the assets stay retrievable from the run even
+        # if the release step fails.
+        uses: actions/upload-artifact@v4
+        with:
+          name: bidichan-${{ steps.version.outputs.version }}
+          if-no-files-found: error
+          path: |
+            dist/bidichan-linux-amd64
+            dist/bidichan-linux-arm64
+            dist/bidichan-linux-armv7
+            dist/bidichan_*.ipk
+            dist/SHA256SUMS
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          # A tag containing a hyphen is a pre-release (v2.1.0-rc1); a plain
+          # version tag is not.
+          case "$TAG" in
+            *-*) prerelease=--prerelease ;;
+            *)   prerelease= ;;
+          esac
+
+          assets="dist/bidichan-linux-amd64 dist/bidichan-linux-arm64"
+          assets="$assets dist/bidichan-linux-armv7 dist/SHA256SUMS"
+          assets="$assets $(ls dist/bidichan_*.ipk)"
+
+          # Re-running the workflow for a tag must not fail on an existing
+          # release: create it the first time, then replace the assets.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists — replacing assets"
+            # shellcheck disable=SC2086
+            gh release upload "$TAG" $assets --clobber
+          else
+            # shellcheck disable=SC2086
+            gh release create "$TAG" $assets \
+              --title "$TAG" \
+              --generate-notes \
+              $prerelease
+          fi
