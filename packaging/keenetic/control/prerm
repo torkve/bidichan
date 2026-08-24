@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stop the service before removal so no stray process is left behind.
+[ -x /opt/etc/init.d/S60bidichan ] && /opt/etc/init.d/S60bidichan stop 2>/dev/null
+exit 0

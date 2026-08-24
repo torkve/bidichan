@@ -1,0 +1,267 @@
+#!/bin/sh
+# bidichan service control for Keenetic.
+#
+#   /opt/etc/init.d/S60bidichan start|stop|restart|status|genpsk
+#
+# Two things make this work on a bare Keenetic with no Entware at all:
+#
+#  * It is self-contained — it does not source Entware's rc.func.
+#  * Autostart needs nothing extra. Keenetic's OPKG component runs
+#    /opt/etc/init.d/* in alphabetical order when /opt/etc/initrc is
+#    absent (which it is without Entware), and runs them via Entware's
+#    rc.unslung when it is present. Either way this script is invoked.
+#
+# The firmware calls boot scripts with no argument, so no argument means
+# start. It also enforces a 24-second timeout per script, so start must
+# return promptly — the supervisor is backgrounded and start only waits
+# long enough to confirm the process came up.
+#
+# ---- configuration --------------------------------------------------
+# The bidichan subcommand: "connect" (this router dials out to a peer —
+# the usual case behind NAT) or "listen" (this router accepts peers).
+MODE="connect"
+# Peer config. Edit with: vi /opt/etc/bidichan/bidichan.conf
+PROFILE="/opt/etc/bidichan/bidichan.conf"
+# Set to "no" to keep the service installed but stop it auto-starting.
+ENABLED="yes"
+# ---------------------------------------------------------------------
+
+NAME="bidichan"
+BIN="/opt/sbin/bidichan"
+PSKFILE="/opt/etc/bidichan/psk.hex"
+SUPPID="/opt/var/run/$NAME.sup.pid"
+CHILDPID="/opt/var/run/$NAME.pid"
+LOGFILE="/opt/var/log/$NAME.log"
+# One rotation at this size keeps the log from filling a small internal
+# flash partition; total on-disk stays under twice this.
+LOGMAX=524288
+# Restart backoff: first retry after MINDELAY, doubling to MAXDELAY, and
+# reset to MINDELAY once a run lasts HEALTHY seconds. Without the backoff
+# a config error would spin the CPU respawning a process that cannot start.
+MINDELAY=5
+MAXDELAY=300
+HEALTHY=60
+
+PATH=/opt/sbin:/opt/bin:/opt/usr/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+# Absolute path to this script: the supervisor is started by re-executing
+# it, and the firmware may invoke us via a relative path.
+SELF="$0"
+case "$SELF" in
+    /*) ;;
+    *)  SELF="$(pwd)/$SELF" ;;
+esac
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $NAME: $*" >> "$LOGFILE"; }
+
+# alive <pidfile> [exe] — true when the pid in the file is live and really
+# ours, so a recycled pid from a stale pidfile is never signalled.
+alive() {
+    [ -f "$1" ] || return 1
+    read -r _p < "$1" 2>/dev/null || return 1
+    [ -n "$_p" ] && [ -d "/proc/$_p" ] || return 1
+    if [ -n "$2" ] && [ -r "/proc/$_p/exe" ]; then
+        [ "$(readlink "/proc/$_p/exe" 2>/dev/null)" = "$2" ] && return 0
+    fi
+    grep -q "$NAME" "/proc/$_p/cmdline" 2>/dev/null
+}
+
+pidof_file() { read -r _p < "$1" 2>/dev/null && echo "$_p"; }
+
+rotate_log() {
+    [ -f "$LOGFILE" ] || return 0
+    _sz=$(wc -c < "$LOGFILE" 2>/dev/null || echo 0)
+    [ "$_sz" -gt "$LOGMAX" ] 2>/dev/null && mv -f "$LOGFILE" "$LOGFILE.old"
+    return 0
+}
+
+# gen_hex32 — 32 random bytes as lowercase hex. Which hex dumper exists
+# depends on how the shell was provided: the firmware's BusyBox and
+# Entware's are built with different applet sets (Entware's, for one, has
+# od and hexdump but no xxd), so try them in turn rather than assume.
+gen_hex32() {
+    if command -v od >/dev/null 2>&1; then
+        head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+    elif command -v hexdump >/dev/null 2>&1; then
+        head -c 32 /dev/urandom | hexdump -v -e '/1 "%02x"'
+    elif command -v xxd >/dev/null 2>&1; then
+        head -c 32 /dev/urandom | xxd -p -c 64 | tr -d '\n'
+    else
+        return 1
+    fi
+}
+
+# ensure_psk — generate a PSK on first use so the service has a usable
+# secret without the operator having to run openssl/od by hand. Never
+# overwrites an existing key, and does nothing when the config carries an
+# inline `psk =` (the `psk-file` key does not match: it has no `=` next).
+ensure_psk() {
+    if [ -f "$PROFILE" ] && grep -qE '^[[:space:]]*psk[[:space:]]*=' "$PROFILE"; then
+        return 0
+    fi
+    [ -s "$PSKFILE" ] && return 0
+    mkdir -p "$(dirname "$PSKFILE")"
+    if ! gen_hex32 > "$PSKFILE.tmp" 2>/dev/null; then
+        rm -f "$PSKFILE.tmp"
+        echo "$NAME: could not generate a PSK" >&2
+        return 1
+    fi
+    # 64 hex chars = 32 bytes. Refuse to install a short/empty key rather
+    # than let the daemon fail later with a confusing handshake error.
+    if [ "$(wc -c < "$PSKFILE.tmp")" -ne 64 ]; then
+        rm -f "$PSKFILE.tmp"
+        echo "$NAME: generated PSK has the wrong length" >&2
+        return 1
+    fi
+    mv -f "$PSKFILE.tmp" "$PSKFILE"
+    chmod 600 "$PSKFILE"
+    echo "$NAME: generated a new PSK in $PSKFILE"
+    echo "  ---> copy this value to the OTHER peer; the two must match:"
+    echo "       $(cat "$PSKFILE")"
+    log "generated a new PSK in $PSKFILE"
+    return 0
+}
+
+# The supervisor: runs the binary, and restarts it when it dies. This is
+# the autorestart the platform does not provide — neither the firmware's
+# OPKG component nor Entware's rc.func supervises anything.
+supervise() {
+    echo "$$" > "$SUPPID"
+    trap 'kill "$child" 2>/dev/null; rm -f "$SUPPID" "$CHILDPID"; exit 0' TERM INT
+    delay="$MINDELAY"
+    while :; do
+        rotate_log
+        "$BIN" "$MODE" "$PROFILE" >> "$LOGFILE" 2>&1 &
+        child=$!
+        echo "$child" > "$CHILDPID"
+        started=$(date +%s 2>/dev/null || echo 0)
+        wait "$child"
+        rc=$?
+        rm -f "$CHILDPID"
+        stopped=$(date +%s 2>/dev/null || echo 0)
+        # A run that lasted a while was healthy; treat the next failure as
+        # a fresh incident rather than continuing to back off.
+        if [ "$((stopped - started))" -ge "$HEALTHY" ]; then
+            delay="$MINDELAY"
+        fi
+        log "exited (rc=$rc), restarting in ${delay}s"
+        sleep "$delay"
+        delay=$((delay * 2))
+        [ "$delay" -gt "$MAXDELAY" ] && delay="$MAXDELAY"
+    done
+}
+
+start() {
+    if [ "$ENABLED" != "yes" ]; then
+        echo "$NAME: disabled (ENABLED=no in $0)"
+        return 0
+    fi
+    if alive "$SUPPID"; then
+        echo "$NAME: already running (supervisor pid $(pidof_file "$SUPPID"))"
+        return 0
+    fi
+    if [ ! -x "$BIN" ]; then
+        echo "$NAME: $BIN missing or not executable" >&2
+        return 1
+    fi
+    if [ ! -f "$PROFILE" ]; then
+        echo "$NAME: config $PROFILE not found" >&2
+        return 1
+    fi
+    mkdir -p "$(dirname "$SUPPID")" "$(dirname "$LOGFILE")"
+    rm -f "$SUPPID" "$CHILDPID"
+    ensure_psk || return 1
+    # setsid detaches the supervisor from this script's session, so the
+    # firmware's 24s script timeout cannot take it down with us. The
+    # supervisor records its own pid, so it does not matter whether
+    # setsid forks or execs.
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$SELF" __supervise >/dev/null 2>&1 &
+    else
+        "$SELF" __supervise >/dev/null 2>&1 &
+    fi
+    # Wait briefly for the daemon to appear, so a config error is reported
+    # here rather than silently looping in the background.
+    i=0
+    while [ "$i" -lt 8 ]; do
+        if alive "$CHILDPID" "$BIN"; then
+            echo "$NAME: started (pid $(pidof_file "$CHILDPID"), supervised)"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    if alive "$SUPPID"; then
+        echo "$NAME: supervisor is up but $BIN is not staying alive — see $LOGFILE" >&2
+        return 1
+    fi
+    echo "$NAME: failed to start — see $LOGFILE" >&2
+    return 1
+}
+
+stop() {
+    _stopped=no
+    # Kill the supervisor FIRST, so it cannot respawn the daemon between
+    # our reading the pid and signalling it. Its TERM trap kills the child.
+    if alive "$SUPPID"; then
+        kill "$(pidof_file "$SUPPID")" 2>/dev/null
+        i=0
+        while [ "$i" -lt 10 ] && alive "$SUPPID"; do
+            sleep 1
+            i=$((i + 1))
+        done
+        _stopped=yes
+    fi
+    # Belt and braces: if the supervisor died without reaping it (SIGKILL,
+    # crash), take the daemon down directly.
+    if alive "$CHILDPID" "$BIN"; then
+        _c="$(pidof_file "$CHILDPID")"
+        kill "$_c" 2>/dev/null
+        i=0
+        while [ "$i" -lt 10 ] && alive "$CHILDPID" "$BIN"; do
+            sleep 1
+            i=$((i + 1))
+        done
+        if alive "$CHILDPID" "$BIN"; then
+            echo "$NAME: still up after SIGTERM, sending SIGKILL"
+            kill -9 "$_c" 2>/dev/null
+            sleep 1
+        fi
+        _stopped=yes
+    fi
+    rm -f "$SUPPID" "$CHILDPID"
+    if [ "$_stopped" = yes ]; then
+        echo "$NAME: stopped"
+    else
+        echo "$NAME: not running"
+    fi
+    return 0
+}
+
+status() {
+    if alive "$CHILDPID" "$BIN"; then
+        echo "$NAME: running (pid $(pidof_file "$CHILDPID"), supervisor $(pidof_file "$SUPPID")), mode=$MODE"
+        return 0
+    fi
+    if alive "$SUPPID"; then
+        echo "$NAME: not running — supervisor $(pidof_file "$SUPPID") is retrying, see $LOGFILE"
+        return 1
+    fi
+    echo "$NAME: not running"
+    return 1
+}
+
+# No argument means start: the firmware runs boot scripts that way.
+case "${1:-start}" in
+    start)          start ;;
+    stop)           stop ;;
+    restart)        stop; start ;;
+    status|check)   status ;;
+    genpsk)         ensure_psk ;;
+    __supervise)    supervise ;;
+    *)
+        echo "usage: $0 {start|stop|restart|status|genpsk}" >&2
+        exit 1
+        ;;
+esac

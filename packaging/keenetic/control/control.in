@@ -1,0 +1,13 @@
+Package: bidichan
+Version: @VERSION@
+Depends:
+Source: https://github.com/torkve/bidichan
+License: see LICENSE file
+Section: net
+Architecture: @ARCH@
+Installed-Size: @ISIZE@
+Maintainer: Vsevolod Velichko <torkvemada@sorokdva.net>
+Description: bidirectional resumable transport over an HTTPS WebSocket.
+ Port forwarding, HTTP/SOCKS5 proxy, L3 TUN and PTY shell channels over one
+ authenticated, network-outage-surviving link. Console-configured via
+ /opt/etc/bidichan/bidichan.conf and /opt/etc/init.d/S60bidichan.

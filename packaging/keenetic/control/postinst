@@ -1,0 +1,34 @@
+#!/bin/sh
+# Runs on `opkg install`.
+chmod 755 /opt/etc/init.d/S60bidichan 2>/dev/null
+mkdir -p /opt/var/run /opt/var/log 2>/dev/null
+
+# Generate a PSK now, so the operator sees the value at install time and can
+# copy it to the other peer. Idempotent: it never replaces an existing key,
+# so reinstalling or upgrading keeps the current one.
+/opt/etc/init.d/S60bidichan genpsk 2>/dev/null
+
+cat <<'MSG'
+
+bidichan installed.
+
+  1. Point it at the far end:
+       vi /opt/etc/bidichan/bidichan.conf
+     (a PSK was generated above into /opt/etc/bidichan/psk.hex — copy that
+      value to the other peer; both ends must match)
+
+  2. Choose connect (dial out) or listen — the MODE line in:
+       vi /opt/etc/init.d/S60bidichan
+
+  3. Start it:
+       /opt/etc/init.d/S60bidichan start
+     (also: stop | restart | status)
+
+  Autostart is automatic: rc.unslung runs /opt/etc/init.d/S* at boot. The
+  service is supervised and restarts itself if it dies.
+
+  TUN channels additionally need `opkg install ip-full`; forward, socks5,
+  http and shell channels do not.
+
+MSG
+exit 0

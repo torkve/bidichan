@@ -20,7 +20,14 @@ CGO := CGO_ENABLED=0
 # go build is incremental anyway, so rebuilding unconditionally costs nothing.
 DIST := dist/bidichan-linux-arm64 dist/bidichan-linux-armv7 dist/bidichan-linux-amd64
 
-.PHONY: all build dist test clean $(DIST)
+# Keenetic (MT7621, e.g. KN-1810 Ultra) is little-endian soft-float MIPS, and
+# Entware's opkg feed for it calls that arch mipsel-3.4. opkg versions carry no
+# leading "v", so strip the one `git describe` emits.
+KEENETIC_ARCH   := mipsel-3.4
+OPKG_VERSION    := $(VERSION:v%=%)
+KEENETIC_IPK    := dist/bidichan_$(OPKG_VERSION)_$(KEENETIC_ARCH).ipk
+
+.PHONY: all build dist test clean keenetic $(DIST) dist/bidichan-linux-mipsle
 
 all: build
 
@@ -40,9 +47,19 @@ dist/bidichan-linux-armv7:
 dist/bidichan-linux-amd64:
 	$(CGO) GOOS=linux GOARCH=amd64 go build $(GOFLAGS) -o $@ .
 
+# Keenetic build: the mipsle binary plus an installable .ipk. GOMIPS=softfloat
+# because the Entware mipsel-3.4 userland is soft-float; a hard-float binary
+# faults on the first FP op. Static (CGO off) so it needs nothing from the
+# firmware's libc.
+dist/bidichan-linux-mipsle:
+	$(CGO) GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build $(GOFLAGS) -o $@ .
+
+keenetic: dist/bidichan-linux-mipsle
+	packaging/keenetic/build-ipk.sh dist/bidichan-linux-mipsle $(OPKG_VERSION) $(KEENETIC_ARCH) $(KEENETIC_IPK)
+
 test:
 	go test -race ./...
 
 clean:
 	rm -f bidichan
-	rm -rf dist/bidichan-linux-*
+	rm -rf dist/bidichan-linux-* dist/bidichan_*.ipk
