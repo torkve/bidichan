@@ -44,6 +44,12 @@ type Peer struct {
 	pending    sync.Map // channelID -> *pendingOpen (locally-initiated awaiting ack)
 	nextChanID atomic.Uint64
 
+	// inflightOpens maps a responder-side open still inside HandleOpen to an
+	// abort flag. A close must take effect even when it outruns the open —
+	// otherwise the open completes afterwards and strands its resources (e.g.
+	// a bound listener) with nobody left to close them.
+	inflightOpens sync.Map // channelID -> *atomic.Bool
+
 	// Handlers maps each channel kind to the implementation that owns it.
 	// Implementations are registered by the daemon before Start() is called.
 	handlers map[ChannelKind]ChannelHandler
@@ -377,6 +383,9 @@ func (p *Peer) dispatch(ctx context.Context, env Envelope) error {
 		if err := json.Unmarshal(env.Payload, &oc); err != nil {
 			return err
 		}
+		// Register before spawning: a MsgCloseChannel for this id can be
+		// dispatched while handleOpen is still setting the channel up.
+		p.inflightOpens.Store(oc.ChannelID, new(atomic.Bool))
 		go p.handleOpen(ctx, oc)
 		return nil
 	case MsgOpenAck:
@@ -415,6 +424,10 @@ func (p *Peer) dispatch(ctx context.Context, env Envelope) error {
 }
 
 func (p *Peer) handleOpen(ctx context.Context, oc OpenChannel) {
+	abortv, _ := p.inflightOpens.Load(oc.ChannelID) // stored by dispatch
+	// Keep the entry until the channel is stored (or the open has failed), so
+	// handleClose can always reach one of the two: the flag or the channel.
+	defer p.inflightOpens.Delete(oc.ChannelID)
 	h, ok := p.handlers[oc.Kind]
 	if !ok {
 		_ = p.ctrl.send(Envelope{Type: MsgOpenNack, Payload: mustJSON(OpenNack{
@@ -442,6 +455,19 @@ func (p *Peer) handleOpen(ctx context.Context, oc OpenChannel) {
 		createdAt:  time.Now(),
 		cancel:     cancel,
 	})
+	if abort, ok := abortv.(*atomic.Bool); ok && abort.Load() {
+		// The originator gave up while HandleOpen was running: tear the
+		// channel down instead of acking. LoadAndDelete arbitrates with a
+		// concurrent handleClose so exactly one side closes the runner.
+		if v, ok := p.channels.LoadAndDelete(oc.ChannelID); ok {
+			st := v.(*channelState)
+			st.cancel()
+			if st.runner != nil {
+				_ = st.runner.Close()
+			}
+		}
+		return
+	}
 	_ = p.ctrl.send(Envelope{Type: MsgOpenAck, Payload: mustJSON(OpenAck{
 		ChannelID: oc.ChannelID,
 		Info:      info,
@@ -512,7 +538,16 @@ func (p *Peer) ChannelRunner(chID uint64) (ChannelRunner, bool) {
 func (p *Peer) handleClose(cc CloseChannel) {
 	v, ok := p.channels.LoadAndDelete(cc.ChannelID)
 	if !ok {
-		return
+		// The open for this id may still be inside HandleOpen: flag it so
+		// handleOpen tears the channel down instead of completing it.
+		if f, inflight := p.inflightOpens.Load(cc.ChannelID); inflight {
+			f.(*atomic.Bool).Store(true)
+		}
+		// The open may also have finished between the two lookups; only give
+		// up if the channel is still absent after raising the flag.
+		if v, ok = p.channels.LoadAndDelete(cc.ChannelID); !ok {
+			return
+		}
 	}
 	// Surface the peer's reason (e.g. why a shell ended) on this side too — the
 	// CLI that opened the channel only sees the raw byte stream, so the daemon
@@ -557,6 +592,9 @@ func (p *Peer) OpenChannel(ctx context.Context, kind ChannelKind, spec any) (uin
 
 	select {
 	case <-ctx.Done():
+		// The responder may have bound resources (e.g. a listener) and acked
+		// too late; tell it to tear the channel down rather than orphaning it.
+		_ = p.ctrl.send(Envelope{Type: MsgCloseChannel, Payload: mustJSON(CloseChannel{ChannelID: id, Reason: "open timed out"})})
 		return 0, ctx.Err()
 	case res := <-done:
 		if res.err != nil {

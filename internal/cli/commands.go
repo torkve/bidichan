@@ -411,8 +411,10 @@ func runDaemon(parent context.Context, d *daemon.Daemon, logger *log.Logger) err
 // runCommand implements wrapper mode (`connect … -- <command>`): it brings the
 // peer up, opens the configured channels, then runs the command with inherited
 // stdio (sudo-style) and returns an exit code matching the command's. The
-// channels' listeners are bound before the command starts (the daemon fires
-// OnReady only after openAutoChannels), so a command can rely on a forward.
+// daemon fires OnReady only after the first open pass over the channels, so on
+// the happy path their listeners are bound before the command starts; a
+// channel whose first open failed is retried in the background and may bind
+// only after the command is already running.
 func runCommand(parent context.Context, cfg daemon.Config, command []string, logger *log.Logger) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()

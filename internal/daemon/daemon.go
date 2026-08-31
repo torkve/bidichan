@@ -119,13 +119,16 @@ type Config struct {
 	AllowShell bool
 
 	// AutoChannels are channels opened automatically, in order, once a peer is
-	// established (connect side). Best-effort: a failure is logged and the rest
-	// continue. Parsed from the connect `--channel` flag / `channel =` config.
+	// established (connect side). A failure is logged and retried in the
+	// background while the peer lives; the rest of the list continues. Parsed
+	// from the connect `--channel` flag / `channel =` config.
 	AutoChannels []AutoChannel
 
 	// OnReady, if set (connect side), is called once after the peer is up and
 	// the auto-channels have been opened. Used by the command-wrapper to run
-	// the user's command only after the channels' listeners are bound.
+	// the user's command only after the channels' listeners are bound. A
+	// channel that failed its first open may still be retrying when this
+	// fires.
 	OnReady func()
 
 	// OnPeerDown, if set, is called when a peer's session ends. Used by the
@@ -331,8 +334,9 @@ func (d *Daemon) runConnect(ctx context.Context) error {
 		_ = c.Close()
 		return err
 	}
-	// Open the configured channels (best-effort) before signalling ready, so a
-	// command wrapper only runs once their listeners are bound.
+	// First open pass over the configured channels before signalling ready, so
+	// on the happy path a command wrapper only runs once their listeners are
+	// bound; a channel whose open failed keeps retrying in the background.
 	if len(d.cfg.AutoChannels) > 0 {
 		d.openAutoChannels(ctx, p)
 	}
@@ -411,22 +415,70 @@ func (d *Daemon) adoptPeer(ctx context.Context, conn net.Conn, role peer.Role) (
 	return p, nil
 }
 
-// openAutoChannels opens each configured AutoChannel on p, in order, best-effort.
+const (
+	autoChannelRetryMin = 500 * time.Millisecond
+	autoChannelRetryMax = 15 * time.Second
+)
+
+// errAutoChannelConfig marks auto-channel failures no retry can fix.
+var errAutoChannelConfig = errors.New("invalid auto-channel")
+
+// openAutoChannels opens each configured AutoChannel on p, in order. A failed
+// open is retried in the background for as long as the peer lives — the rest
+// of the list is not held up.
 func (d *Daemon) openAutoChannels(ctx context.Context, p *peer.Peer) {
 	for _, ch := range d.cfg.AutoChannels {
 		id, err := d.openAutoChannel(ctx, p, ch)
-		if err != nil {
-			d.logger.Printf("auto-channel %s failed: %v", ch.Kind, err)
+		if err == nil {
+			d.logger.Printf("auto-channel %s opened (id=%d)", ch.Kind, id)
 			continue
 		}
-		d.logger.Printf("auto-channel %s opened (id=%d)", ch.Kind, id)
+		d.logger.Printf("auto-channel %s failed: %v", ch.Kind, err)
+		if errors.Is(err, errAutoChannelConfig) {
+			continue
+		}
+		go d.retryAutoChannel(ctx, p, ch)
+	}
+}
+
+// retryAutoChannel re-attempts a failed auto-channel until it opens or the
+// peer goes away. A restart can race the previous instance for the listen
+// port (EADDRINUSE); the channel must come up once the port frees rather than
+// stay lost until the next restart. Responder-side errors arrive as opaque
+// strings, so every non-config failure is treated as transient.
+func (d *Daemon) retryAutoChannel(ctx context.Context, p *peer.Peer, ch AutoChannel) {
+	delay := autoChannelRetryMin
+	for attempt := 1; ; attempt++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.Done():
+			return
+		case <-time.After(delay):
+		}
+		id, err := d.openAutoChannel(ctx, p, ch)
+		if err == nil {
+			select {
+			case <-p.Done():
+				// The peer tore down while the open was completing; its close
+				// pass may have missed this channel, so close it here.
+				_ = p.CloseChannelByID(id, "peer closed")
+			default:
+				d.logger.Printf("auto-channel %s opened (id=%d, retry %d)", ch.Kind, id, attempt)
+			}
+			return
+		}
+		d.logger.Printf("auto-channel %s retry %d failed: %v", ch.Kind, attempt, err)
+		if delay *= 2; delay > autoChannelRetryMax {
+			delay = autoChannelRetryMax
+		}
 	}
 }
 
 func (d *Daemon) openAutoChannel(ctx context.Context, p *peer.Peer, ch AutoChannel) (uint64, error) {
 	side, err := sideFromString(ch.Side)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("%w: %v", errAutoChannelConfig, err)
 	}
 	octx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -448,7 +500,7 @@ func (d *Daemon) openAutoChannel(ctx context.Context, p *peer.Peer, ch AutoChann
 			TUNSide: side, Name: ch.Name, CIDR: ch.CIDR, CIDR6: ch.CIDR6, MTU: ch.MTU, Label: ch.Label,
 		})
 	default:
-		return 0, fmt.Errorf("unknown channel kind %q", ch.Kind)
+		return 0, fmt.Errorf("%w: unknown channel kind %q", errAutoChannelConfig, ch.Kind)
 	}
 }
 

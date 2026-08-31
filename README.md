@@ -246,8 +246,10 @@ channel = forward -L 8080:internal-api:8443
 channel = socks5 --listen 127.0.0.1:1080
 ```
 
-Malformed specs fail the command immediately. Channels are opened best-effort
-once the peer is up: a failure is logged and the rest still open.
+Malformed specs fail the command immediately. Channels are opened once the peer
+is up; a failure (say, the listen port is still held by a previous instance) is
+logged and retried with backoff until the channel opens, while the rest of the
+list continues.
 
 ### Running a command over the tunnel
 
@@ -255,7 +257,8 @@ once the peer is up: a failure is logged and the rest still open.
 `nsenter`: it brings the peer up, opens the configured channels, runs the
 command with inherited stdin/stdout/stderr, then exits with the command's status
 and tears the tunnel down. The channels' listeners are bound *before* the command
-starts, so the command can rely on a forward:
+starts, so the command can rely on a forward (a channel whose first open failed
+is retried in the background and may bind only after the command is running):
 
 ```sh
 bidichan connect myprofile \
