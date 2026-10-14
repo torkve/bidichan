@@ -118,6 +118,10 @@ type Config struct {
 	// shell on the peer is always allowed regardless of this setting.
 	AllowShell bool
 
+	// DenyKinds are channel kinds the other peer may not open on this host
+	// (forward, http, socks5, tun). This peer can still originate them.
+	DenyKinds []peer.ChannelKind
+
 	// AutoChannels are channels opened automatically, in order, once a peer is
 	// established (connect side). A failure is logged and retried in the
 	// background while the peer lives; the rest of the list continues. Parsed
@@ -384,7 +388,7 @@ func (d *Daemon) adoptPeer(ctx context.Context, conn net.Conn, role peer.Role) (
 	if err != nil {
 		return nil, err
 	}
-	channel.Register(p)
+	channel.Register(p, d.cfg.DenyKinds...)
 	channel.RegisterShell(p, d.cfg.AllowShell)
 	if err := p.Start(ctx); err != nil {
 		return nil, err

@@ -42,6 +42,12 @@ func mustPSK(t *testing.T) []byte {
 // the two peer.Peer objects, with the listener already accepting.
 func pair(t *testing.T, hostname string) (*peer.Peer, *peer.Peer, func()) {
 	t.Helper()
+	return pairDenying(t, hostname)
+}
+
+// pairDenying is pair with the server refusing the client's opens of srvDeny.
+func pairDenying(t *testing.T, hostname string, srvDeny ...peer.ChannelKind) (*peer.Peer, *peer.Peer, func()) {
+	t.Helper()
 	psk := mustPSK(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	logger := log.New(io.Discard, "", 0)
@@ -68,7 +74,7 @@ func pair(t *testing.T, hostname string) (*peer.Peer, *peer.Peer, func()) {
 			errCh <- err
 			return
 		}
-		channel.Register(p)
+		channel.Register(p, srvDeny...)
 		channel.RegisterShell(p, true)
 		if err := p.Start(ctx); err != nil {
 			errCh <- err

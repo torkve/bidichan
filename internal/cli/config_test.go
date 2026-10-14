@@ -6,8 +6,13 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/spf13/pflag"
+
+	"github.com/torkve/bidichan/internal/peer"
 )
 
 func TestParseProfileHappyPath(t *testing.T) {
@@ -290,3 +295,57 @@ func derefStr(p *string) string {
 // silence "imported and not used" if all logger-using tests get
 // commented out.
 var _ = io.Discard
+
+func TestDenyChannel(t *testing.T) {
+	v, err := parseProfile(strings.NewReader("deny-channel = forward, tun\ndeny-channel = HTTP,forward\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := parseDenyChannels(v.DenyChannels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []peer.ChannelKind{peer.KindForward, peer.KindTUN, peer.KindHTTPProxy}
+	if !slices.Equal(got, want) {
+		t.Fatalf("deny kinds = %v, want %v", got, want)
+	}
+
+	for src, wantErr := range map[string]string{
+		"deny-channel = shell\n":        "--allow-shell",
+		"deny-channel = forward, ssh\n": `"ssh"`,
+	} {
+		_, err := parseProfile(strings.NewReader(src))
+		if err == nil || !strings.Contains(err.Error(), wantErr) {
+			t.Errorf("%q: err = %v, want one mentioning %s", src, err, wantErr)
+		}
+	}
+
+	logger := log.New(io.Discard, "", 0)
+	prof := filepath.Join(t.TempDir(), "prof.conf")
+	if err := os.WriteFile(prof, []byte("deny-channel = forward\ndeny-channel = tun\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// applyProfile fills the list flag from every line.
+	fs := pflag.NewFlagSet("listen", pflag.ContinueOnError)
+	var deny []string
+	fs.StringSliceVar(&deny, "deny-channel", nil, "")
+	if _, err := applyProfile(fs, prof, logger); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(deny, []string{"forward", "tun"}) {
+		t.Fatalf("applyProfile deny-channel = %#v", deny)
+	}
+
+	// A CLI-set --deny-channel overrides the config list entirely.
+	fs2 := pflag.NewFlagSet("listen", pflag.ContinueOnError)
+	var deny2 []string
+	fs2.StringSliceVar(&deny2, "deny-channel", nil, "")
+	_ = fs2.Set("deny-channel", "socks5")
+	if _, err := applyProfile(fs2, prof, logger); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(deny2, []string{"socks5"}) {
+		t.Fatalf("override deny-channel = %#v", deny2)
+	}
+}

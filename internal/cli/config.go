@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/spf13/pflag"
+
+	"github.com/torkve/bidichan/internal/peer"
 )
 
 // profileValues holds the union of fields a `listen` or `connect` config
@@ -34,6 +36,7 @@ type profileValues struct {
 	CACert       *string
 	Channels     []string // repeatable: one entry per `channel =` line
 	AllowShell   *bool
+	DenyChannels []string // repeatable: kinds from every `deny-channel =` line
 	NoResume     *bool
 	ResumeGrace  *string
 	MemoryLimit  *string
@@ -233,6 +236,12 @@ func applyKey(out *profileValues, key, val string) error {
 			return fmt.Errorf("allow-shell: %w", err)
 		}
 		out.AllowShell = &b
+	case "deny-channel":
+		kinds := strings.Split(val, ",")
+		if _, err := parseDenyChannels(kinds); err != nil {
+			return err
+		}
+		out.DenyChannels = append(out.DenyChannels, kinds...)
 	case "no-resume":
 		b, err := parseBool(val)
 		if err != nil {
@@ -262,9 +271,32 @@ func applyKey(out *profileValues, key, val string) error {
 		}
 		out.StreamWindow = strPtr(val)
 	default:
-		return fmt.Errorf("unknown key %q (known keys: addr, unix-socket, hostname, psk, psk-file, no-tls-binding, cert, key, socket, decoy-backend, path, cacert, channel, allow-shell, no-resume, resume-grace, memory-limit, resume-buffer, stream-window)", key)
+		return fmt.Errorf("unknown key %q (known keys: addr, unix-socket, hostname, psk, psk-file, no-tls-binding, cert, key, socket, decoy-backend, path, cacert, channel, allow-shell, deny-channel, no-resume, resume-grace, memory-limit, resume-buffer, stream-window)", key)
 	}
 	return nil
+}
+
+// parseDenyChannels validates the kinds named by --deny-channel / the
+// deny-channel key and returns them typed, without duplicates.
+func parseDenyChannels(names []string) ([]peer.ChannelKind, error) {
+	var out []peer.ChannelKind
+	seen := map[peer.ChannelKind]bool{}
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		k := peer.ChannelKind(strings.ToLower(n))
+		switch k {
+		case peer.KindForward, peer.KindHTTPProxy, peer.KindSocks5, peer.KindTUN:
+		case peer.KindShell:
+			return nil, errors.New("deny-channel: shell is already refused unless --allow-shell is set")
+		default:
+			return nil, fmt.Errorf("deny-channel: unknown channel kind %q (expected forward, http, socks5 or tun)", n)
+		}
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return out, nil
 }
 
 func strPtr(s string) *string { return &s }
@@ -395,6 +427,14 @@ func applyProfile(fs *pflag.FlagSet, source string, logger *log.Logger) (string,
 			set("allow-shell", "true")
 		} else {
 			set("allow-shell", "false")
+		}
+	}
+	// A list, like "channel": a CLI --deny-channel replaces the config list.
+	if len(v.DenyChannels) > 0 && !fs.Changed("deny-channel") {
+		if f := fs.Lookup("deny-channel"); f != nil {
+			for _, k := range v.DenyChannels {
+				_ = f.Value.Set(k)
+			}
 		}
 	}
 	if v.NoResume != nil {

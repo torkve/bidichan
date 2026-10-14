@@ -114,6 +114,7 @@ func newListenCmd() *cobra.Command {
 		decoyBackend string
 		wsPath       string
 		allowShell   bool
+		denyChannels []string
 		noResume     bool
 		resumeGrace  time.Duration
 		tuning       tuningDef
@@ -168,6 +169,11 @@ or /etc/bidichan/<name>.conf.`,
 				return fmt.Errorf("bad PSK: %w", err)
 			}
 
+			denyKinds, err := parseDenyChannels(denyChannels)
+			if err != nil {
+				return err
+			}
+
 			bindAddr := addr
 			network := "tcp"
 			if unixPath != "" {
@@ -186,6 +192,7 @@ or /etc/bidichan/<name>.conf.`,
 				DecoyBackend:     decoyBackend,
 				Path:             wsPath,
 				AllowShell:       allowShell,
+				DenyKinds:        denyKinds,
 				DisableResume:    noResume,
 				ResumeGrace:      resumeGrace,
 				ControlSocket:    sock,
@@ -213,6 +220,7 @@ or /etc/bidichan/<name>.conf.`,
 	f.StringVar(&decoyBackend, "decoy-backend", "", "proxy unauthenticated connections to this real web backend (host:port or unix:/path) instead of the built-in static page")
 	f.StringVar(&wsPath, "path", "", "WebSocket upgrade request path (default: derived from the PSK; logged at startup)")
 	f.BoolVar(&allowShell, "allow-shell", false, "allow the peer to open an interactive shell on this host (grants the peer RCE)")
+	f.StringSliceVar(&denyChannels, "deny-channel", nil, "refuse the peer's opens of these channel kinds on this host: forward, http, socks5, tun (comma-separated, repeatable)")
 	f.BoolVar(&noResume, "no-resume", false, "do not hold a peer's session open for it to reconnect to; every connection dies with its network")
 	f.DurationVar(&resumeGrace, "resume-grace", 0, "how long to hold a session for a client that lost its network (default 90s)")
 	tuning.register(f)
@@ -238,6 +246,7 @@ func newConnectCmd() *cobra.Command {
 		caCert      string
 		channels    []string
 		allowShell  bool
+		denyChans   []string
 		noResume    bool
 		resumeGrace time.Duration
 		tuning      tuningDef
@@ -319,6 +328,11 @@ command's status and tears the tunnel down.`,
 				return fmt.Errorf("bad PSK: %w", err)
 			}
 
+			denyKinds, err := parseDenyChannels(denyChans)
+			if err != nil {
+				return err
+			}
+
 			autoChannels := make([]daemon.AutoChannel, 0, len(channels))
 			for _, spec := range channels {
 				ac, err := parseAutoChannel(spec)
@@ -339,6 +353,7 @@ command's status and tears the tunnel down.`,
 				CACert:           caCert,
 				AutoChannels:     autoChannels,
 				AllowShell:       allowShell,
+				DenyKinds:        denyKinds,
 				DisableResume:    noResume,
 				ResumeGrace:      resumeGrace,
 				ControlSocket:    sock,
@@ -374,6 +389,7 @@ command's status and tears the tunnel down.`,
 	f.StringVar(&caCert, "cacert", "", "PEM bundle to verify the server cert against (for self-signed / private CA); default: system trust store")
 	f.StringArrayVar(&channels, "channel", nil, "channel to open once connected, e.g. \"forward -L 8080:host:80\" (repeatable; same syntax as 'channel open')")
 	f.BoolVar(&allowShell, "allow-shell", false, "allow the peer to open an interactive shell on this host (grants the peer RCE)")
+	f.StringSliceVar(&denyChans, "deny-channel", nil, "refuse the peer's opens of these channel kinds on this host: forward, http, socks5, tun (comma-separated, repeatable)")
 	f.BoolVar(&noResume, "no-resume", false, "do not resume the session over a new connection when the network drops; the peer dies with it")
 	f.DurationVar(&resumeGrace, "resume-grace", 0, "how long the network may be gone before the session is given up (default 90s)")
 	tuning.register(f)

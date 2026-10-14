@@ -387,6 +387,21 @@ remote code execution — on that host, so enable it only on hosts you intend to
 administer over the link. Requires an interactive terminal (a TTY) on the side
 running the command.
 
+### Refusing channel kinds
+
+Either peer can refuse kinds of channels the **other** peer opens on it, the
+way an unset `--allow-shell` refuses shells:
+
+```sh
+bidichan listen --deny-channel forward,tun ...   # or: deny-channel = forward, tun
+```
+
+Valid kinds are `forward`, `http`, `socks5` and `tun` (comma-separated or
+repeated). A refused open fails on the opening side with the peer's reason. The
+refusal covers both directions a channel can take on this host: denying
+`forward` stops the peer from binding a listener here *and* from having this
+host dial out. This host can still open the denied kinds on the peer.
+
 ### Close a channel
 
 ```sh
