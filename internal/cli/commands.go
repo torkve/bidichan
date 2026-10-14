@@ -113,6 +113,7 @@ func newListenCmd() *cobra.Command {
 		sock         string
 		decoyBackend string
 		wsPath       string
+		clientCA     string
 		allowShell   bool
 		denyChannels []string
 		noResume     bool
@@ -174,6 +175,10 @@ or /etc/bidichan/<name>.conf.`,
 				return err
 			}
 
+			if clientCA != "" && unixPath != "" {
+				return errors.New("listen: --client-ca needs TLS terminated here; behind a reverse proxy, have the proxy verify client certificates")
+			}
+
 			bindAddr := addr
 			network := "tcp"
 			if unixPath != "" {
@@ -191,6 +196,7 @@ or /etc/bidichan/<name>.conf.`,
 				TransportNetwork: network,
 				DecoyBackend:     decoyBackend,
 				Path:             wsPath,
+				ClientCA:         clientCA,
 				AllowShell:       allowShell,
 				DenyKinds:        denyKinds,
 				DisableResume:    noResume,
@@ -219,6 +225,7 @@ or /etc/bidichan/<name>.conf.`,
 	f.StringVar(&keyPath, "key", "", "TLS key PEM; ignored in unix-socket mode")
 	f.StringVar(&decoyBackend, "decoy-backend", "", "proxy unauthenticated connections to this real web backend (host:port or unix:/path) instead of the built-in static page")
 	f.StringVar(&wsPath, "path", "", "WebSocket upgrade request path (default: derived from the PSK; logged at startup)")
+	f.StringVar(&clientCA, "client-ca", "", "require clients to present a certificate issued by a CA in this PEM bundle (mutual TLS, on top of the PSK); TLS mode only")
 	f.BoolVar(&allowShell, "allow-shell", false, "allow the peer to open an interactive shell on this host (grants the peer RCE)")
 	f.StringSliceVar(&denyChannels, "deny-channel", nil, "refuse the peer's opens of these channel kinds on this host: forward, http, socks5, tun (comma-separated, repeatable)")
 	f.BoolVar(&noResume, "no-resume", false, "do not hold a peer's session open for it to reconnect to; every connection dies with its network")
@@ -244,6 +251,8 @@ func newConnectCmd() *cobra.Command {
 		sock        string
 		wsPath      string
 		caCert      string
+		clientCert  string
+		clientKey   string
 		channels    []string
 		allowShell  bool
 		denyChans   []string
@@ -327,6 +336,12 @@ command's status and tears the tunnel down.`,
 			if err != nil {
 				return fmt.Errorf("bad PSK: %w", err)
 			}
+			if (clientCert == "") != (clientKey == "") {
+				return errors.New("connect: --client-cert and --client-key must be given together")
+			}
+			if clientCert != "" && unixPath != "" {
+				return errors.New("connect: --client-cert needs TLS, which --unix-socket skips")
+			}
 
 			denyKinds, err := parseDenyChannels(denyChans)
 			if err != nil {
@@ -351,6 +366,8 @@ command's status and tears the tunnel down.`,
 				SkipBinding:      noBind,
 				Path:             wsPath,
 				CACert:           caCert,
+				ClientCertPath:   clientCert,
+				ClientKeyPath:    clientKey,
 				AutoChannels:     autoChannels,
 				AllowShell:       allowShell,
 				DenyKinds:        denyKinds,
@@ -387,6 +404,8 @@ command's status and tears the tunnel down.`,
 	f.BoolVar(&noBind, "no-tls-binding", false, "omit the certificate channel binding from auth — required when the server is behind a TLS-terminating reverse proxy")
 	f.StringVar(&wsPath, "path", "", "WebSocket upgrade request path (default: derived from the PSK; must match the server)")
 	f.StringVar(&caCert, "cacert", "", "PEM bundle to verify the server cert against (for self-signed / private CA); default: system trust store")
+	f.StringVar(&clientCert, "client-cert", "", "PEM client certificate to present when the server requires one (mutual TLS); needs --client-key")
+	f.StringVar(&clientKey, "client-key", "", "PEM private key for --client-cert")
 	f.StringArrayVar(&channels, "channel", nil, "channel to open once connected, e.g. \"forward -L 8080:host:80\" (repeatable; same syntax as 'channel open')")
 	f.BoolVar(&allowShell, "allow-shell", false, "allow the peer to open an interactive shell on this host (grants the peer RCE)")
 	f.StringSliceVar(&denyChans, "deny-channel", nil, "refuse the peer's opens of these channel kinds on this host: forward, http, socks5, tun (comma-separated, repeatable)")

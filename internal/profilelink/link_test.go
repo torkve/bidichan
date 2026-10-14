@@ -1,10 +1,18 @@
 package profilelink
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
 	"strings"
 	"testing"
+	"time"
 )
 
 func sample() *Link {
@@ -39,7 +47,7 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	in.Version = Version
+	in.Version = 1 // no client certificate
 	if got, want := mustJSON(t, out), mustJSON(t, in); got != want {
 		t.Fatalf("round trip changed the profile:\n got %s\nwant %s", got, want)
 	}
@@ -173,6 +181,28 @@ const testCAPEM = "-----BEGIN CERTIFICATE-----\n" +
 	"ALbTTGwfL5w6zbSakqKpm6ImZRumf72QShZHajHqIgQu\n" +
 	"-----END CERTIFICATE-----\n"
 
+// testClientCertPEM and testClientKeyPEM are a fixed self-signed client
+// certificate and its key, fixed for the same reason as testCAPEM. The key is
+// a throwaway made for this test and authenticates nothing.
+const testClientCertPEM = "" +
+	"-----BEGIN CERTIFICATE-----\n" +
+	"MIIBZjCCAQygAwIBAgIBAjAKBggqhkjOPQQDAjAnMSUwIwYDVQQDExxiaWRpY2hh\n" +
+	"biBwcm9maWxlIGxpbmsgY2xpZW50MCAXDTcwMDEwMTAwMDAwMFoYDzIxMDAwMTAx\n" +
+	"MDAwMDAwWjAnMSUwIwYDVQQDExxiaWRpY2hhbiBwcm9maWxlIGxpbmsgY2xpZW50\n" +
+	"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEg7sRyN54iCJ+ay+hZbiIfWYs67C6\n" +
+	"wtqh6oYEqHogT6vqE63ZEn90kbkNM3q1DFswUDIHsOS6+crpwc67elseeKMnMCUw\n" +
+	"DgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMCMAoGCCqGSM49BAMC\n" +
+	"A0gAMEUCIQCX1v0Qq9VaG1RzD8MjiYSEyzd6NH97gCm0W+ebxwA1zAIgC1GEwhRf\n" +
+	"k+Hvaht2nbRJvwwwjrMa7d6IbxjNbWuZcXM=\n" +
+	"-----END CERTIFICATE-----\n"
+
+const testClientKeyPEM = "" +
+	"-----BEGIN EC PRIVATE KEY-----\n" +
+	"MHcCAQEEIMFJY8I4Stkvgq73XqWH/21/iaq6yXwWsCCIibd+FaJ1oAoGCCqGSM49\n" +
+	"AwEHoUQDQgAEg7sRyN54iCJ+ay+hZbiIfWYs67C6wtqh6oYEqHogT6vqE63ZEn90\n" +
+	"kbkNM3q1DFswUDIHsOS6+crpwc67elseeA==\n" +
+	"-----END EC PRIVATE KEY-----\n"
+
 // everything is a link with every field set, so nothing can go unnoticed by
 // being zero.
 func everything() *Link {
@@ -183,6 +213,8 @@ func everything() *Link {
 		Path:               "/events",
 		NoTLSBinding:       true,
 		CACertPEM:          testCAPEM,
+		ClientCertPEM:      testClientCertPEM,
+		ClientKeyPEM:       testClientKeyPEM,
 		EnableTUN:          true,
 		TUNCIDR:            "10.42.0.2/24",
 		TUNCIDR6:           "fd00:bd::2/64",
@@ -211,7 +243,7 @@ func everything() *Link {
 // exception is the certificate: it is a fixture, not part of the format, so if
 // it ever has to be replaced, update it here and in testCAPEM together and
 // leave Version alone.
-const goldenPayload = `{"v":1,"name":"gate","addr":"gate.example.com:443","host":"gate.example.com",` +
+const goldenPayload = `{"v":2,"name":"gate","addr":"gate.example.com:443","host":"gate.example.com",` +
 	`"path":"/events","noBind":true,"ca":"` +
 	`-----BEGIN CERTIFICATE-----\n` +
 	`MIIBbTCCAROgAwIBAgIBATAKBggqhkjOPQQDAjAlMSMwIQYDVQQDExpiaWRpY2hh\n` +
@@ -223,6 +255,24 @@ const goldenPayload = `{"v":1,"name":"gate","addr":"gate.example.com:443","host"
 	`hkjOPQQDAgNIADBFAiBvfp0g+aaQkNgeBwKGYBzAKSc44zokFCalGBxn29TsmgIh\n` +
 	`ALbTTGwfL5w6zbSakqKpm6ImZRumf72QShZHajHqIgQu\n` +
 	`-----END CERTIFICATE-----\n",` +
+	`"ccert":"` +
+	`-----BEGIN CERTIFICATE-----\n` +
+	`MIIBZjCCAQygAwIBAgIBAjAKBggqhkjOPQQDAjAnMSUwIwYDVQQDExxiaWRpY2hh\n` +
+	`biBwcm9maWxlIGxpbmsgY2xpZW50MCAXDTcwMDEwMTAwMDAwMFoYDzIxMDAwMTAx\n` +
+	`MDAwMDAwWjAnMSUwIwYDVQQDExxiaWRpY2hhbiBwcm9maWxlIGxpbmsgY2xpZW50\n` +
+	`MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEg7sRyN54iCJ+ay+hZbiIfWYs67C6\n` +
+	`wtqh6oYEqHogT6vqE63ZEn90kbkNM3q1DFswUDIHsOS6+crpwc67elseeKMnMCUw\n` +
+	`DgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMCMAoGCCqGSM49BAMC\n` +
+	`A0gAMEUCIQCX1v0Qq9VaG1RzD8MjiYSEyzd6NH97gCm0W+ebxwA1zAIgC1GEwhRf\n` +
+	`k+Hvaht2nbRJvwwwjrMa7d6IbxjNbWuZcXM=\n` +
+	`-----END CERTIFICATE-----\n` +
+	`","ckey":"` +
+	`-----BEGIN EC PRIVATE KEY-----\n` +
+	`MHcCAQEEIMFJY8I4Stkvgq73XqWH/21/iaq6yXwWsCCIibd+FaJ1oAoGCCqGSM49\n` +
+	`AwEHoUQDQgAEg7sRyN54iCJ+ay+hZbiIfWYs67C6wtqh6oYEqHogT6vqE63ZEn90\n` +
+	`kbkNM3q1DFswUDIHsOS6+crpwc67elseeA==\n` +
+	`-----END EC PRIVATE KEY-----\n` +
+	`",` +
 	`"tun":true,"cidr":"10.42.0.2/24","cidr6":"fd00:bd::2/64","mtu":1400,"full":true,"mem":40,"grace":90,` +
 	`"chans":[{"label":"web","kind":"http","allInterfaces":true,"port":3128,"target":"","routeSystem":true},` +
 	`{"label":"","kind":"forwardLocal","allInterfaces":false,"port":8080,"target":"10.0.0.5:80","routeSystem":false}],` +
@@ -304,16 +354,114 @@ func TestNoChannelsIsAnEmptyArray(t *testing.T) {
 // A version is only useful if old links keep working; only one from the future
 // is refused, since we cannot know what it means.
 //
-// While Version is 1 this asserts only that format 1 is readable. It becomes
-// the real check the moment Version is bumped — leave the literal 1 here rather
-// than following Version up, and add the new number as a second case.
+// Leave the literal 1 here rather than following Version up. Format 1 had no
+// client certificate keys at all, so they are dropped from the payload to make
+// it look the way a format 1 link really did.
 func TestAcceptsAnOlderVersion(t *testing.T) {
+	l := everything()
+	l.Version = 1
+	l.ClientCertPEM, l.ClientKeyPEM = "", ""
+	payload, _ := json.Marshal(l)
+	var v1 map[string]any
+	if err := json.Unmarshal(payload, &v1); err != nil {
+		t.Fatal(err)
+	}
+	delete(v1, "ccert")
+	delete(v1, "ckey")
+	payload, _ = json.Marshal(v1)
+	raw := "bidichan://profile#" + base64.RawURLEncoding.EncodeToString(payload)
+	if _, err := Parse(raw); err != nil {
+		t.Fatalf("refused a link from format 1: %v", err)
+	}
+}
+
+// A client certificate is what format 2 exists for: a link claiming format 1
+// while carrying one would be imported without it by an app that reads only
+// format 1, so it is refused here rather than blessed.
+func TestRefusesAClientCertificateInFormat1(t *testing.T) {
 	l := everything()
 	l.Version = 1
 	payload, _ := json.Marshal(l)
 	raw := "bidichan://profile#" + base64.RawURLEncoding.EncodeToString(payload)
-	if _, err := Parse(raw); err != nil {
-		t.Fatalf("refused a link from format 1: %v", err)
+	if _, err := Parse(raw); err == nil || !strings.Contains(err.Error(), "format 1") {
+		t.Fatalf("format 1 link with a client certificate: err = %v", err)
+	}
+}
+
+// serverOnlyPair returns a certificate and key whose extended key usage
+// permits server authentication only.
+func serverOnlyPair(t *testing.T) (string, string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tpl := &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: "server only"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kd, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+		string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kd}))
+}
+
+// Format 2 only added the client certificate, so a link without one is still
+// stamped 1 and stays importable by apps that only read format 1.
+func TestNoClientCertificateStaysFormat1(t *testing.T) {
+	raw, err := sample().Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload := payloadOf(t, raw); !strings.HasPrefix(payload, `{"v":1,`) {
+		t.Fatalf("a link without a client certificate is not format 1: %.40s", payload)
+	}
+}
+
+// A client key is a credential like the PSK, and has to load as a pair with
+// its certificate — the same test the client applies when it connects.
+func TestClientCertificate(t *testing.T) {
+	l := sample()
+	l.ClientCertPEM, l.ClientKeyPEM = testClientCertPEM, testClientKeyPEM
+	if !l.HasSecret() {
+		t.Fatal("a profile carrying a client key did not report a secret")
+	}
+	raw, err := l.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.ClientCertPEM != testClientCertPEM || out.ClientKeyPEM != testClientKeyPEM {
+		t.Fatal("the client certificate did not survive the round trip")
+	}
+	if out.Version != 2 {
+		t.Fatalf("a link with a client certificate is format %d, want 2", out.Version)
+	}
+
+	for name, mut := range map[string]func(*Link){
+		"cert without key": func(l *Link) { l.ClientKeyPEM = "" },
+		"key without cert": func(l *Link) { l.ClientCertPEM = "" },
+		"mismatched pair":  func(l *Link) { l.ClientCertPEM = testCAPEM },
+		"server-auth only": func(l *Link) { l.ClientCertPEM, l.ClientKeyPEM = serverOnlyPair(t) },
+	} {
+		bad := sample()
+		bad.ClientCertPEM, bad.ClientKeyPEM = testClientCertPEM, testClientKeyPEM
+		mut(bad)
+		if _, err := bad.Encode(); err == nil {
+			t.Errorf("%s: encoded", name)
+		}
 	}
 }
 

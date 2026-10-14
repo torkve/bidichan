@@ -15,6 +15,7 @@
 package profilelink
 
 import (
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -33,9 +34,15 @@ const (
 	Scheme = "bidichan"
 	Host   = "profile"
 
-	// Version is the payload version. A reader that does not know a version
-	// refuses the link rather than guessing at its meaning.
-	Version = 1
+	// Version is the newest payload version, the highest Parse accepts. A
+	// reader that does not know a version refuses the link rather than
+	// guessing at its meaning.
+	//
+	// 2 added the client certificate and key (ccert, ckey). Encode stamps it
+	// only on a link that carries them, so a link without one stays readable
+	// by apps that only know 1, while one with a certificate is refused there
+	// instead of being imported without it.
+	Version = 2
 
 	// MaxBytes caps the link. A real profile, including a CA certificate, is a
 	// few kilobytes; this leaves generous room while keeping a link someone
@@ -75,6 +82,12 @@ type Link struct {
 
 	NoTLSBinding bool   `json:"noBind"`
 	CACertPEM    string `json:"ca"`
+
+	// ClientCertPEM and ClientKeyPEM are the client certificate presented to a
+	// server that requires one (mutual TLS); both or neither. The key is a
+	// secret in the same sense as PSKHex — see HasSecret.
+	ClientCertPEM string `json:"ccert"`
+	ClientKeyPEM  string `json:"ckey"`
 
 	EnableTUN  bool   `json:"tun"`
 	TUNCIDR    string `json:"cidr"`
@@ -118,15 +131,18 @@ var knownKinds = map[string]bool{
 	"forwardRemote": true,
 }
 
-// HasSecret reports whether the link carries the pre-shared key, so a client
-// can say so before importing or sharing.
-func (l *Link) HasSecret() bool { return l.PSKHex != "" }
+// HasSecret reports whether the link carries a secret — the pre-shared key or
+// a client private key — so a client can say so before importing or sharing.
+func (l *Link) HasSecret() bool { return l.PSKHex != "" || l.ClientKeyPEM != "" }
 
 // Encode renders the link. It validates first: a link that cannot be imported
 // is worse than no link, because the failure surfaces on someone else's device.
 func (l *Link) Encode() (string, error) {
 	c := *l
-	c.Version = Version
+	c.Version = 1
+	if c.ClientCertPEM != "" || c.ClientKeyPEM != "" {
+		c.Version = 2
+	}
 	if err := c.validate(); err != nil {
 		return "", err
 	}
@@ -184,6 +200,12 @@ func Parse(raw string) (*Link, error) {
 		return nil, fmt.Errorf(
 			"profile link: made by a newer version of the app (format %d, this one reads %d)",
 			l.Version, Version)
+	}
+	// A client certificate needs format 2, which is what makes an app that
+	// only reads 1 refuse the link instead of importing it without one. A
+	// format 1 link carrying one was not written by Encode.
+	if l.Version < 2 && (l.ClientCertPEM != "" || l.ClientKeyPEM != "") {
+		return nil, errors.New("profile link: damaged (a client certificate in a format 1 link)")
 	}
 	if err := l.validate(); err != nil {
 		return nil, err
@@ -266,6 +288,27 @@ func (l *Link) validate() error {
 	if l.CACertPEM != "" && !x509.NewCertPool().AppendCertsFromPEM([]byte(l.CACertPEM)) {
 		return errors.New("profile link: no certificates found in the CA bundle")
 	}
+	// The same pairing test the client applies when the profile is used
+	// (transport.ClientCertFromPEM), without its validity-window check: a link
+	// may well be imported before or after the certificate is current.
+	if l.ClientCertPEM != "" || l.ClientKeyPEM != "" {
+		if l.ClientCertPEM == "" || l.ClientKeyPEM == "" {
+			return errors.New("profile link: a client certificate needs both the certificate and its key")
+		}
+		pair, err := tls.X509KeyPair([]byte(l.ClientCertPEM), []byte(l.ClientKeyPEM))
+		if err != nil {
+			return errors.New("profile link: the client certificate and key do not load as a pair")
+		}
+		leaf := pair.Leaf
+		if leaf == nil { // GODEBUG=x509keypairleaf=0 leaves it unparsed
+			if leaf, err = x509.ParseCertificate(pair.Certificate[0]); err != nil {
+				return errors.New("profile link: the client certificate does not parse")
+			}
+		}
+		if !allowsClientAuth(leaf) {
+			return errors.New("profile link: the client certificate is not usable for client authentication")
+		}
+	}
 	if l.TUNMTU != 0 && (l.TUNMTU < minTunMTU || l.TUNMTU > maxTunMTU) {
 		return fmt.Errorf("profile link: MTU %d is outside %d-%d", l.TUNMTU, minTunMTU, maxTunMTU)
 	}
@@ -333,6 +376,21 @@ func (l *Link) validate() error {
 		}
 	}
 	return nil
+}
+
+// allowsClientAuth mirrors transport.AllowsClientAuth: no extended key usage
+// at all, or one that includes clientAuth or any. A certificate marked for
+// server use only is refused by every server that verifies client certificates.
+func allowsClientAuth(leaf *x509.Certificate) bool {
+	if len(leaf.ExtKeyUsage) == 0 && len(leaf.UnknownExtKeyUsage) == 0 {
+		return true
+	}
+	for _, u := range leaf.ExtKeyUsage {
+		if u == x509.ExtKeyUsageClientAuth || u == x509.ExtKeyUsageAny {
+			return true
+		}
+	}
+	return false
 }
 
 // checkHostPort rejects anything that is not a dialable host:port. requireHost

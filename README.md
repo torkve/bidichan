@@ -837,6 +837,71 @@ Trade-offs to know about:
   caught at the MAC check, because the binding is the SHA-256 of the server
   cert's public key and the two ends would derive different values.
 
+## Client certificates (mutual TLS)
+
+On top of the PSK, the server can require every client to present a
+certificate issued by a CA you control, which gives each client its own
+identity. A client without a valid certificate fails the TLS handshake itself,
+so with mTLS on, unauthenticated visitors get a TLS error instead of the decoy
+page. Without the option, nothing changes.
+
+There is no per-certificate revocation (no CRL, OCSP or serial denylist): a
+certificate stays trusted until it expires. Issue short-lived certificates, and
+to withdraw trust from every certificate under a CA, replace the CA and
+restart the server.
+
+Issue a CA and a client certificate. The client certificate must allow client
+authentication (`extendedKeyUsage = clientAuth`); one marked for server use
+only is rejected:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+  -subj /CN=Example -keyout ca.key -out ca.pem
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -subj /CN=laptop -keyout client.key -out client.csr
+openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 365 \
+  -extfile <(printf 'extendedKeyUsage=clientAuth\nkeyUsage=digitalSignature') -out client.pem
+```
+
+The server sends the CA's subject name to everyone who connects, so give it a
+bland one.
+
+**Standalone (bidichan terminates TLS):**
+
+```sh
+bidichan listen  ... --client-ca ca.pem                                  # or: client-ca = ca.pem
+bidichan connect ... --client-cert client.pem --client-key client.key    # or: client-cert / client-key
+```
+
+The server logs the subject and serial of each client that authenticates.
+`--client-ca` only works where bidichan terminates TLS: it is refused with
+`--unix-socket`.
+
+**Behind nginx:** nginx terminates TLS, so nginx checks the certificate. The
+client side is the same (`--client-cert` / `--client-key`):
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name ws.example.com;
+    # ... ssl_certificate etc. as above ...
+    ssl_client_certificate /etc/nginx/bidichan-client-ca.pem;
+    ssl_verify_client      on;
+    # ...
+}
+```
+
+`ssl_verify_client` has to be set at `server {}` level. Inside a `location` it
+depends on TLS renegotiation, which bidichan never does (and TLS 1.3 does not
+have). As a result, everything else under that `server_name`, including the
+cover site, also requires a certificate.
+
+Certificates are read at startup. A certificate that is already expired or not
+yet valid is refused on startup. One that expires while the client is running
+makes the next reconnect fail. To pick up a new certificate or CA, restart the
+daemon. The mobile clients take the certificate and key as PEM, and a profile
+link can carry them. Like a PSK, a link that includes the key is a credential.
+
 ## Standalone mode (not recommended)
 
 bidichan can terminate TLS itself, with no front proxy. This is convenient for

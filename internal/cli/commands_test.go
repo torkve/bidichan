@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
 
@@ -80,14 +81,39 @@ func TestListenAndConnectFlags(t *testing.T) {
 		}
 	}
 	// listen-only.
-	for _, flag := range []string{"cert", "key"} {
+	for _, flag := range []string{"cert", "key", "client-ca"} {
 		if findCmd(t, root, "listen").Flags().Lookup(flag) == nil {
 			t.Errorf("listen missing --%s", flag)
 		}
 	}
 	// connect-only.
-	if findCmd(t, root, "connect").Flags().Lookup("no-tls-binding") == nil {
-		t.Errorf("connect missing --no-tls-binding")
+	for _, flag := range []string{"no-tls-binding", "client-cert", "client-key"} {
+		if findCmd(t, root, "connect").Flags().Lookup(flag) == nil {
+			t.Errorf("connect missing --%s", flag)
+		}
+	}
+}
+
+// Mutual-TLS settings that cannot work are refused before anything starts.
+func TestMutualTLSFlagsRefused(t *testing.T) {
+	common := []string{"--hostname", "h.example.com", "--psk", "00ff", "--socket", t.TempDir() + "/c.sock"}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{append([]string{"listen", "--unix-socket", t.TempDir() + "/d.sock", "--client-ca", "/nonexistent/ca.pem"}, common...), "--client-ca needs TLS"},
+		{append([]string{"connect", "--addr", "127.0.0.1:1", "--client-cert", "/nonexistent/c.pem"}, common...), "must be given together"},
+		{append([]string{"connect", "--addr", "127.0.0.1:1", "--client-key", "/nonexistent/k.pem"}, common...), "must be given together"},
+		{append([]string{"connect", "--unix-socket", t.TempDir() + "/d.sock", "--client-cert", "/nonexistent/c.pem", "--client-key", "/nonexistent/k.pem"}, common...), "--client-cert needs TLS"},
+	} {
+		root := newRootCmd()
+		root.SetArgs(tc.args)
+		root.SetOut(io.Discard)
+		root.SetErr(io.Discard)
+		err := root.Execute()
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%v: err = %v, want one mentioning %q", tc.args, err, tc.want)
+		}
 	}
 }
 

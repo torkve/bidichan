@@ -57,6 +57,13 @@ type ServerConfig struct {
 	// clients — chiefly Grace, the window in which a client that lost the
 	// network may come back and pick up its channels.
 	ResumeConfig ResumeConfig
+
+	// ClientCAs, when non-nil, turns on mutual TLS: every client must present
+	// a certificate issued by one of these CAs, on top of knowing the PSK. A
+	// client without one fails the TLS handshake itself — it never reaches
+	// the decoy. Not available in plain mode, where the reverse proxy owns TLS
+	// and has to verify client certificates itself.
+	ClientCAs *x509.CertPool
 }
 
 // plainMode is true when the listener does not terminate TLS itself.
@@ -122,6 +129,10 @@ func Listen(ctx context.Context, addr string, cfg ServerConfig) (*Listener, erro
 	}
 	cfg.Logger.Printf("transport: websocket upgrade path is %s", l.path)
 
+	if cfg.ClientCAs != nil && cfg.plainMode() {
+		return nil, errors.New("transport: client certificates cannot be verified in plain mode; configure the reverse proxy to verify them")
+	}
+
 	if !cfg.plainMode() {
 		cert, err := LoadOrGenerateCert(cfg.CertPath, cfg.KeyPath, cfg.Hostname)
 		if err != nil {
@@ -145,6 +156,10 @@ func Listen(ctx context.Context, addr string, cfg ServerConfig) (*Listener, erro
 				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 			},
 			NextProtos: []string{"http/1.1"},
+		}
+		if cfg.ClientCAs != nil {
+			l.tlsC.ClientAuth = tls.RequireAndVerifyClientCert
+			l.tlsC.ClientCAs = cfg.ClientCAs
 		}
 
 		leaf := cert.Leaf
@@ -231,8 +246,9 @@ func (l *Listener) handle(raw net.Conn, out chan<- net.Conn) {
 	_ = raw.SetDeadline(time.Now().Add(15 * time.Second))
 
 	var (
-		appConn net.Conn
-		binding []byte
+		appConn    net.Conn
+		binding    []byte
+		clientCert *x509.Certificate // verified client certificate, mTLS only
 	)
 	if l.cfg.plainMode() {
 		// No TLS — the reverse proxy already did it. The auth binding
@@ -256,6 +272,9 @@ func (l *Listener) handle(raw net.Conn, out chan<- net.Conn) {
 		}
 		appConn = tlsConn
 		binding = l.binding
+		if len(st.PeerCertificates) > 0 {
+			clientCert = st.PeerCertificates[0]
+		}
 	}
 
 	_ = appConn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -277,6 +296,10 @@ func (l *Listener) handle(raw net.Conn, out chan<- net.Conn) {
 		l.cfg.Logger.Printf("transport: rejecting %s: auth %v", raw.RemoteAddr(), err)
 		l.serveDecoy(appConn, br, req)
 		return
+	}
+	if clientCert != nil {
+		l.cfg.Logger.Printf("transport: %s authenticated with client certificate %q (serial %s)",
+			raw.RemoteAddr(), clientCert.Subject.String(), clientCert.SerialNumber.Text(16))
 	}
 
 	// The resume cookie carries its own MAC over the same handshake, so it can

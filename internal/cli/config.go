@@ -34,6 +34,9 @@ type profileValues struct {
 	DecoyBackend *string
 	Path         *string
 	CACert       *string
+	ClientCA     *string
+	ClientCert   *string
+	ClientKey    *string
 	Channels     []string // repeatable: one entry per `channel =` line
 	AllowShell   *bool
 	DenyChannels []string // repeatable: kinds from every `deny-channel =` line
@@ -228,6 +231,12 @@ func applyKey(out *profileValues, key, val string) error {
 		out.Path = strPtr(val)
 	case "cacert":
 		out.CACert = strPtr(expandPath(val))
+	case "client-ca":
+		out.ClientCA = strPtr(expandPath(val))
+	case "client-cert":
+		out.ClientCert = strPtr(expandPath(val))
+	case "client-key":
+		out.ClientKey = strPtr(expandPath(val))
 	case "channel":
 		out.Channels = append(out.Channels, val)
 	case "allow-shell":
@@ -271,7 +280,7 @@ func applyKey(out *profileValues, key, val string) error {
 		}
 		out.StreamWindow = strPtr(val)
 	default:
-		return fmt.Errorf("unknown key %q (known keys: addr, unix-socket, hostname, psk, psk-file, no-tls-binding, cert, key, socket, decoy-backend, path, cacert, channel, allow-shell, deny-channel, no-resume, resume-grace, memory-limit, resume-buffer, stream-window)", key)
+		return fmt.Errorf("unknown key %q (known keys: addr, unix-socket, hostname, psk, psk-file, no-tls-binding, cert, key, socket, decoy-backend, path, cacert, client-ca, client-cert, client-key, channel, allow-shell, deny-channel, no-resume, resume-grace, memory-limit, resume-buffer, stream-window)", key)
 	}
 	return nil
 }
@@ -411,6 +420,15 @@ func applyProfile(fs *pflag.FlagSet, source string, logger *log.Logger) (string,
 	}
 	if v.CACert != nil {
 		set("cacert", *v.CACert)
+	}
+	if v.ClientCA != nil {
+		set("client-ca", *v.ClientCA)
+	}
+	if v.ClientCert != nil {
+		set("client-cert", *v.ClientCert)
+	}
+	if v.ClientKey != nil {
+		set("client-key", *v.ClientKey)
 	}
 	// "channel" is a list (StringArray): the per-call Changed guard in set()
 	// would skip all but the first, so handle it once for the whole list. CLI

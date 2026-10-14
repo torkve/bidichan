@@ -55,7 +55,10 @@ psk            = ff
 no-tls-binding = false
 cert           = /tmp/c.pem
 key            = /tmp/k.pem
-socket         = /tmp/s.sock`
+socket         = /tmp/s.sock
+client-ca      = /tmp/ca.pem
+client-cert    = /tmp/cc.pem
+client-key     = /tmp/ck.pem`
 	v, err := parseProfile(strings.NewReader(srcInline))
 	if err != nil {
 		t.Fatal(err)
@@ -68,6 +71,9 @@ socket         = /tmp/s.sock`
 		"cert":        v.Cert,
 		"key":         v.Key,
 		"socket":      v.Socket,
+		"client-ca":   v.ClientCA,
+		"client-cert": v.ClientCert,
+		"client-key":  v.ClientKey,
 	} {
 		if ptr == nil {
 			t.Errorf("%s not parsed", k)

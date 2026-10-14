@@ -30,6 +30,11 @@ type ProfileLink struct {
 	NoTlsBinding bool
 	CaCertPem    string
 
+	// ClientCertPem and ClientKeyPem are the client certificate for a server
+	// that requires one; both or neither. The key is a secret like PskHex.
+	ClientCertPem string
+	ClientKeyPem  string
+
 	EnableTun  bool
 	TunCidr    string
 	TunCidr6   string
@@ -55,8 +60,9 @@ type ProfileLink struct {
 // NewProfileLink returns an empty link to fill in.
 func NewProfileLink() *ProfileLink { return &ProfileLink{} }
 
-// HasSecret reports whether the pre-shared key is included.
-func (p *ProfileLink) HasSecret() bool { return p.PskHex != "" }
+// HasSecret reports whether a secret is included: the pre-shared key or the
+// client private key.
+func (p *ProfileLink) HasSecret() bool { return p.PskHex != "" || p.ClientKeyPem != "" }
 
 // Encode renders the shareable link, refusing a profile that could not be
 // imported on the other side.
@@ -68,6 +74,8 @@ func (p *ProfileLink) Encode() (string, error) {
 		Path:               p.Path,
 		NoTLSBinding:       p.NoTlsBinding,
 		CACertPEM:          p.CaCertPem,
+		ClientCertPEM:      p.ClientCertPem,
+		ClientKeyPEM:       p.ClientKeyPem,
 		EnableTUN:          p.EnableTun,
 		TUNCIDR:            p.TunCidr,
 		TUNCIDR6:           p.TunCidr6,
@@ -102,6 +110,8 @@ func ParseProfileLink(raw string) (*ProfileLink, error) {
 		Path:               l.Path,
 		NoTlsBinding:       l.NoTLSBinding,
 		CaCertPem:          l.CACertPEM,
+		ClientCertPem:      l.ClientCertPEM,
+		ClientKeyPem:       l.ClientKeyPEM,
 		EnableTun:          l.EnableTUN,
 		TunCidr:            l.TUNCIDR,
 		TunCidr6:           l.TUNCIDR6,

@@ -9,6 +9,7 @@ package mobile
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
@@ -136,6 +137,15 @@ func (c *Client) start(cfg *Config, tweak func(*daemon.Config), register, onFail
 			return errors.New("cacert: no certificates found in PEM")
 		}
 	}
+	var clientCert *tls.Certificate
+	if len(cfg.ClientCertPEM) > 0 || len(cfg.ClientKeyPEM) > 0 {
+		if len(cfg.ClientCertPEM) == 0 || len(cfg.ClientKeyPEM) == 0 {
+			return errors.New("client certificate: both the certificate and its key are required")
+		}
+		if clientCert, err = transport.ClientCertFromPEM(cfg.ClientCertPEM, cfg.ClientKeyPEM); err != nil {
+			return fmt.Errorf("client certificate: %w", err)
+		}
+	}
 
 	c.mu.Lock()
 	if c.closed {
@@ -164,6 +174,7 @@ func (c *Client) start(cfg *Config, tweak func(*daemon.Config), register, onFail
 		Path:         cfg.Path,
 		SkipBinding:  cfg.NoTLSBinding,
 		RootCAs:      pool,
+		ClientCert:   clientCert,
 		HelloID:      fp,
 		EmbedControl: true,
 		Logger:       logger,

@@ -37,6 +37,12 @@ type Config struct {
 	// CACertPEM optionally pins the server to a PEM CA bundle. Empty uses the
 	// system trust store.
 	CACertPEM []byte
+	// ClientCertPEM and ClientKeyPEM are the client certificate and its key,
+	// presented when the server requires one (mutual TLS) — in addition to
+	// the PSK. Both or neither. The key is a secret: keep it in the Keychain /
+	// Keystore and hand it over only here.
+	ClientCertPEM []byte
+	ClientKeyPEM  []byte
 	// Fingerprint selects the uTLS ClientHello to mimic, together with a
 	// matching User-Agent: "ios" (default), "android", "safari" or "chrome".
 	// Set it to whatever the device it runs on would plausibly present — a

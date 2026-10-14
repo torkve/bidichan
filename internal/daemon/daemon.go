@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
@@ -93,6 +94,23 @@ type Config struct {
 	// memory rather than on disk (the iOS mobile facade). Takes precedence over
 	// CACert.
 	RootCAs *x509.CertPool
+
+	// ClientCA, on the listen side, is a path to a PEM bundle of the CAs a
+	// client certificate must chain to. Setting it turns on mutual TLS: a
+	// client must then present such a certificate as well as know the PSK.
+	// Not valid with TransportNetwork "unix", where the reverse proxy owns TLS.
+	ClientCA string
+
+	// ClientCertPath and ClientKeyPath, on the connect side, name the PEM
+	// certificate and key presented to a server that asks for one (mutual
+	// TLS). Both or neither.
+	ClientCertPath string
+	ClientKeyPath  string
+
+	// ClientCert, when non-nil, is the connect-side client certificate held
+	// in memory (the mobile facade). Takes precedence over ClientCertPath and
+	// ClientKeyPath.
+	ClientCert *tls.Certificate
 
 	// HelloID selects the uTLS ClientHello fingerprint on the connect side.
 	// The zero value keeps the default (Chrome); the mobile client sets it to
@@ -249,6 +267,17 @@ func (d *Daemon) runListen(ctx context.Context) error {
 	if d.cfg.TransportNetwork == "unix" {
 		_ = os.Remove(d.cfg.BindAddr) // remove stale socket
 	}
+	var clientCAs *x509.CertPool
+	if d.cfg.ClientCA != "" {
+		pem, err := os.ReadFile(d.cfg.ClientCA)
+		if err != nil {
+			return fmt.Errorf("read --client-ca: %w", err)
+		}
+		clientCAs = x509.NewCertPool()
+		if !clientCAs.AppendCertsFromPEM(pem) {
+			return fmt.Errorf("--client-ca %s: no certificates found", d.cfg.ClientCA)
+		}
+	}
 	lis, err := transport.Listen(ctx, d.cfg.BindAddr, transport.ServerConfig{
 		Hostname:      d.cfg.Hostname,
 		PSK:           d.cfg.PSK,
@@ -260,6 +289,7 @@ func (d *Daemon) runListen(ctx context.Context) error {
 		Path:          d.cfg.Path,
 		DisableResume: d.cfg.DisableResume,
 		ResumeConfig:  transport.ResumeConfig{Grace: d.cfg.ResumeGrace, MaxBuffer: d.cfg.ResumeBuffer},
+		ClientCAs:     clientCAs,
 	})
 	if err != nil {
 		return err
@@ -309,10 +339,21 @@ func (d *Daemon) runConnect(ctx context.Context) error {
 			return fmt.Errorf("--cacert %s: no certificates found", d.cfg.CACert)
 		}
 	}
+	clientCert := d.cfg.ClientCert
+	if clientCert == nil && (d.cfg.ClientCertPath != "" || d.cfg.ClientKeyPath != "") {
+		if d.cfg.ClientCertPath == "" || d.cfg.ClientKeyPath == "" {
+			return errors.New("--client-cert and --client-key must be given together")
+		}
+		var err error
+		if clientCert, err = transport.LoadClientCert(d.cfg.ClientCertPath, d.cfg.ClientKeyPath); err != nil {
+			return fmt.Errorf("--client-cert: %w", err)
+		}
+	}
 	cliCfg := transport.ClientConfig{
 		Hostname:    d.cfg.Hostname,
 		PSK:         d.cfg.PSK,
 		RootCAs:     rootCAs,
+		ClientCert:  clientCert,
 		Network:     d.cfg.TransportNetwork,
 		SkipBinding: d.cfg.SkipBinding,
 		Path:        d.cfg.Path,

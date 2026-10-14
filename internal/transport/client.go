@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
@@ -32,6 +33,13 @@ type ClientConfig struct {
 	// roots are used; the server certificate is always verified (there is no
 	// option to skip verification).
 	RootCAs *x509.CertPool
+
+	// ClientCert, when non-nil, is presented to a server that asks for a
+	// client certificate (mutual TLS) — the bidichan listener started with a
+	// client CA, or a reverse proxy verifying client certificates in front of
+	// it. It is in addition to the PSK, not instead of it. Refused when
+	// Network is "unix", where there is no TLS to present it in.
+	ClientCert *tls.Certificate
 
 	// Network selects the transport. "" / "tcp" (default) dials TCP and
 	// negotiates a uTLS Chrome-compatible TLS session. "unix" dials a
@@ -104,6 +112,9 @@ func dial(ctx context.Context, addr string, cfg ClientConfig, resume *resumeRequ
 	if network != "tcp" && network != "unix" {
 		return nil, nil, fmt.Errorf("transport: invalid network %q", network)
 	}
+	if network == "unix" && cfg.ClientCert != nil {
+		return nil, nil, errors.New("transport: a client certificate needs TLS, which the unix network skips")
+	}
 	// The upgrade request below is composed by hand, so anything that ends a
 	// line would let whoever supplied these compose the request instead of us.
 	// They reach here from a config file, a command line, or a profile someone
@@ -140,6 +151,13 @@ func dial(ctx context.Context, addr string, cfg ClientConfig, resume *resumeRequ
 		tlsC := &utls.Config{
 			ServerName: cfg.Hostname,
 			RootCAs:    cfg.RootCAs,
+		}
+		if c := cfg.ClientCert; c != nil {
+			tlsC.Certificates = []utls.Certificate{{
+				Certificate: c.Certificate,
+				PrivateKey:  c.PrivateKey,
+				Leaf:        c.Leaf,
+			}}
 		}
 		uconn := utls.UClient(raw, tlsC, utls.HelloCustom)
 		spec, err := helloSpec(clientHelloID(cfg))
